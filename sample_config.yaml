@@ -1,0 +1,152 @@
+# =============================================================================
+# Synology Manager configuration sample -- parser-valid placeholders only
+# =============================================================================
+# This is an executable version: 1 configuration, not a connection profile.
+# It contains no DSM endpoint or credentials. Supply those separately with CLI
+# options or SYN_HOST, SYN_USERNAME, and SYN_PASSWORD. `host` below is only a
+# logical identifier; it is never an endpoint, URL, authentication input, or TLS
+# setting. `synology-manager apply-config -c PATH --do-it` mutates DSM after
+# its safety gates. DANGER: Configuration is authoritative for every configured
+# present share's ACL and NFS exports: omitting `acl` clears its ACL, and omitting
+# `nfs` clears all exports when applied. Read every alternative below before applying.
+
+# Required. Only integer 1 is accepted.
+version: 1
+
+# Required logical identifier: a trimmed safe name, not a DSM endpoint.
+# Root `hosts` is invalid legacy syntax; use this single `host` and `volumes`.
+host: sample-host
+
+# Required non-empty list. Each volume name is required, unique, and must be
+# `volume` followed by a positive integer (for example volume1); it becomes
+# /volume1 internally. Omitted shares are unmanaged and are never pruned.
+# Parser defaults: `volumes[].shares` defaults to []; a share description defaults
+# to ""; omitted quota, `quota: null`, or `quota: 0` is unlimited (0 MiB); state
+# defaults to present; and `nfs.rules` defaults to [] when `nfs` is present. For
+# present shares only, omitted acl is authoritative empty ACL
+# (inherit_parent/recursive false), and omitted nfs is authoritative zero exports.
+# For absent shares, any acl or nfs value is ignored; deletion clears live exports
+# before deleting the share, and ACL is not reconciled.
+volumes:
+  - name: volume1
+    shares:
+      # A configured share is managed. Required `name` is a trimmed 1..128-character
+      # name beginning with alphanumeric; allowed remaining characters are letters,
+      # digits, space, period, underscore, and hyphen. `homes` is unsupported.
+      - name: example-share
+
+        # Optional string; default is an empty string.
+        description: "Reserved example share; replace before applying"
+
+        # Optional capacity quota. A scalar is GiB, so this means 2 GiB (2048 MiB).
+        # Omit quota or use `quota: null` or `quota: 0` for unlimited (canonical 0 MiB).
+        # ALTERNATIVES -- replace the active `quota: 2` line with exactly one:
+        # quota: {value: 512, unit: MiB}  # object requires non-negative integer value
+        # quota: {value: 2, unit: GiB}    # and unit GiB or MiB
+        # quota: null                     # unlimited
+        quota: 2
+
+        # Optional: present is the default. Accepted values: present, absent.
+        # `present` creates/reconciles this share. An omitted share is unmanaged.
+        state: present
+
+        # Optional for a present share, but authoritative when omitted: omission
+        # means an empty ACL with inherit_parent: false and recursive: false, so
+# existing ACL rules and inherited state are cleared/replaced. Absent shares
+# ignore acl entirely and do not reconcile ACL. For present shares, `acl: null`,
+# incomplete mappings, and authoritative: false are invalid. A replacement is guarded by DSM's
+        # self-denial check and can deny the acting identity; a denial or unknown
+        # response fails closed before setting the ACL.
+        acl:
+          # All four ACL keys are required whenever acl is present. Only true is
+          # accepted for authoritative; false is rejected.
+          authoritative: true
+          # Required boolean. Whether this share inherits its parent ACL.
+          inherit_parent: false
+          # Required boolean. Whether DSM applies the replacement recursively.
+          recursive: false
+          # Required list of 0..200 complete rules. [] deliberately clears ACL rules.
+          rules:
+            # Each rule requires exactly all five fields below.
+            # principal: non-empty trimmed identity. principal_type is user, group,
+            # or special. Group names use canonical DSM name without leading `@`.
+            # Users may contain `@`; special retains DSM special-principal semantics.
+            - principal: example-group
+              principal_type: group
+              # permissions: read_only, read_write, or full_control.
+              permissions: read_write
+              # inheritance: none, this_folder, children, or all.
+              inheritance: all
+              # effect: allow or deny.
+              effect: allow
+            # ALTERNATIVES -- these are complete additional rules; add either beneath
+            # the active rule only when its distinct (principal_type, principal,
+            # effect) identity is desired:
+            # - principal: fictional.user@example.test
+            #   principal_type: user
+            #   permissions: read_only
+            #   inheritance: this_folder
+            #   effect: allow
+            # - principal: fictional-special-principal
+            #   principal_type: special
+            #   permissions: full_control
+            #   inheritance: none
+            #   effect: deny
+
+         # Optional and authoritative for a configured present share. Omission means
+         # enabled: false with rules: [], which clears all per-share exports. Absent
+         # shares ignore any nfs value; deletion clears live exports before deleting.
+
+        # This never changes the global DSM NFS service. `enabled: false` requires
+        # rules: []; enabled false with non-empty rules is rejected. Either enabled
+        # value with rules: [] clears exports. At most 200 canonical expanded rules
+        # are allowed. The complete list replaces exports: no NFS rule `state`,
+        # tombstones, or obsolete ownership/deletion flags exist.
+        # DSM has no CAS token for full-list saves; baseline re-read and post-save
+        # verification are best effort, not atomic against a concurrent DSM writer.
+        nfs:
+          # Required boolean. true allows a non-empty desired export list; false
+          # requires rules: [] and clears exports.
+          enabled: true
+          # Optional list; default []. Every non-empty rule requires exactly one of
+          # client_cidr/client plus access, root_squash, security_flavors, async,
+          # insecure, and crossmnt.
+          rules:
+            # Use exactly one client form. client_cidr accepts one IP/CIDR or a
+            # non-empty list and expands each item to an independent canonical rule.
+            # 192.0.2.7/24 becomes 192.0.2.0/24; 198.51.100.9 becomes /32.
+            - client_cidr: [192.0.2.7/24, 198.51.100.9]
+              # access: read_only or read_write.
+              access: read_write
+              # root_squash: root, admin, guest, all_admin, or all_guest.
+              root_squash: root
+              # Non-empty unique list: sys, krb5, krb5i, and/or krb5p.
+              security_flavors: [sys]
+              # Each is a required boolean.
+              async: false
+              insecure: false
+              crossmnt: false
+
+        # ALTERNATIVE -- replace the entire active `nfs:` mapping above with this
+        # complete hostname-client mapping; do not combine the two mappings:
+        # nfs:
+        #   enabled: true
+        #   rules:
+        #     - client: nfs-client.example.test
+        #       access: read_only
+        #       root_squash: all_guest
+        #       security_flavors: [krb5, krb5i, krb5p]
+        #       async: true
+        #       insecure: false
+        #       crossmnt: false
+
+        # ALTERNATIVE -- replace the entire active `nfs:` mapping above with exactly
+        # one inline clearing mapping; do not add a second nfs key or combine either:
+        # nfs: {enabled: true, rules: []}
+        # nfs: {enabled: false, rules: []}
+
+      # ALTERNATIVE -- replace the entire active example-share mapping above with
+      # this complete absent-share declaration. Any acl or nfs value is ignored;
+      # deletion clears live exports before deleting and does not reconcile ACL:
+      # - name: example-share
+      #   state: absent
