@@ -14,6 +14,7 @@ class ConnectionConfig:
 class Command(StrEnum):
     LIST_SHARES = "list-shares"
     CREATE_SHARE = "create-share"
+    DELETE_SHARE = "delete-share"
 
 
 class OperationStatus(StrEnum):
@@ -152,6 +153,18 @@ class ShareCreateResult:
     options: ShareCreateOptions = field(default_factory=ShareCreateOptions)
     permissions: tuple[PermissionSpec, ...] = ()
     nfs_permissions: tuple[NfsClientPermission, ...] = ()
+    steps: tuple[ShareOperationStep, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ShareDeleteRequest:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ShareDeleteResult:
+    name: str
+    deleted: bool
     steps: tuple[ShareOperationStep, ...] = ()
 
 

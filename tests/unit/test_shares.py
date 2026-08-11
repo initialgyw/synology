@@ -24,6 +24,8 @@ from synology.models import (
     RecycleBinOptions,
     ShareCreateOptions,
     ShareCreateRequest,
+    ShareDeleteRequest,
+    ShareOperationStep,
 )
 from synology.shares import SynShareClient, _SharePermissionAdapter
 
@@ -35,12 +37,17 @@ class FakeShare:
         error: Exception | None = None,
         create_response: object | None = None,
         create_error: Exception | None = None,
+        delete_response: object | None = None,
+        delete_error: Exception | None = None,
     ) -> None:
         self.response = response
         self.error = error
         self.create_response = create_response
         self.create_error = create_error
+        self.delete_response = delete_response
+        self.delete_error = delete_error
         self.calls: list[tuple[str, list[str]]] = []
+        self.delete_calls: list[list[str]] = []
         self.create_calls: list[dict[str, object]] = []
 
     def list_folders(self, *, share_type: str, additional: list[str]) -> object:
@@ -54,6 +61,12 @@ class FakeShare:
         if self.create_error is not None:
             raise self.create_error
         return self.create_response
+
+    def delete_folders(self, name: list[str]) -> object:
+        self.delete_calls.append(name)
+        if self.delete_error is not None:
+            raise self.delete_error
+        return self.delete_response
 
 
 class FakeRawPermissionApi:
@@ -459,6 +472,54 @@ def test_verbose_logging_excludes_unrecognized_response_fields() -> None:
     assert "session-secret" not in logged
     assert "record-token-secret" not in logged
     assert "share-uuid" in logged
+
+
+def test_delete_share_uses_exact_upstream_arguments() -> None:
+    share = FakeShare(delete_response={"success": True})
+    client = SynShareClient(_config(), _logger(), factory=FakeFactory(share))
+
+    result = client.delete_share(ShareDeleteRequest(name="media"))
+
+    assert share.delete_calls == [["media"]]
+    assert result.name == "media"
+    assert result.deleted is True
+    assert result.steps == (
+        ShareOperationStep(name="delete", status=OperationStatus.SUCCEEDED),
+    )
+
+
+@pytest.mark.parametrize("response", [None, {}, {"success": False}, {"success": 1}])
+def test_malformed_delete_responses_raise_api_error(response: object) -> None:
+    client = SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(FakeShare(delete_response=response)),
+    )
+
+    with pytest.raises(ApiError):
+        client.delete_share(ShareDeleteRequest(name="media"))
+
+
+@pytest.mark.parametrize(
+    ("upstream_error", "expected_exception"),
+    [
+        (LoginError(error_code=400), AuthenticationError),
+        (SSLError("certificate failed"), TransportError),
+        (CoreError(error_code=100), ApiError),
+    ],
+)
+def test_delete_share_maps_upstream_errors(
+    upstream_error: Exception,
+    expected_exception: type[Exception],
+) -> None:
+    client = SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(FakeShare(delete_error=upstream_error)),
+    )
+
+    with pytest.raises(expected_exception):
+        client.delete_share(ShareDeleteRequest(name="media"))
 
 
 def test_create_share_uses_exact_approved_upstream_arguments() -> None:

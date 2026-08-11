@@ -38,6 +38,8 @@ from synology.models import (
     PermissionStatus,
     ShareCreateRequest,
     ShareCreateResult,
+    ShareDeleteRequest,
+    ShareDeleteResult,
     ShareDetails,
     ShareListRequest,
     ShareOperationStep,
@@ -46,6 +48,7 @@ from synology.models import (
 
 SHARE_OPERATION = "SYNO.Core.Share.list"
 CREATE_OPERATION = "SYNO.Core.Share.create"
+DELETE_OPERATION = "SYNO.Core.Share.delete"
 
 
 class ShareApi(Protocol):
@@ -73,6 +76,8 @@ class ShareApi(Protocol):
         encryption: bool = False,
         enc_passwd: str = "",
     ) -> object: ...
+
+    def delete_folders(self, name: list[str]) -> object: ...
 
 
 class SharePermissionApi(Protocol):
@@ -280,6 +285,38 @@ class SynShareClient:
             "Synology API response operation=%s success=%s name=%s",
             CREATE_OPERATION,
             True,
+            result.name,
+        )
+        return result
+
+    def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult:
+        self._logger.debug(
+            "Synology API delete request operation=%s target=%s:%s tls_verify=%s "
+            "parameters=%s",
+            DELETE_OPERATION,
+            self._config.host,
+            self._config.port,
+            not self._config.insecure,
+            sanitize({"name": request.name}),
+        )
+        try:
+            response = self._share.delete_folders([request.name])
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="request")
+        envelope = _as_mapping(response, "invalid share deletion response envelope")
+        if envelope.get("success") is not True:
+            raise ApiError("NAS API returned an unsuccessful share deletion response")
+        result = ShareDeleteResult(
+            name=request.name,
+            deleted=True,
+            steps=(
+                ShareOperationStep(name="delete", status=OperationStatus.SUCCEEDED),
+            ),
+        )
+        self._logger.debug(
+            "Synology API response operation=%s success=%s name=%s",
+            DELETE_OPERATION,
+            result.deleted,
             result.name,
         )
         return result

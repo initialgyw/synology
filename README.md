@@ -100,6 +100,31 @@ syn-cli --verbose list-shares
 syn-cli --verbose --insecure list-shares --output json
 ```
 
+## Delete-share plan mode
+
+Without `--yes`, `delete-share` validates the exact shared-folder name and prints a local plan:
+
+```bash
+syn-cli delete-share projects --output json
+```
+
+Plan mode does not resolve credentials, construct a NAS client, or contact the NAS. It
+returns exit code `11`.
+
+## Confirmed share deletion
+
+`--yes` is required for NAS mutation:
+
+```bash
+syn-cli delete-share projects --yes
+```
+
+The command passes the exact share name to the Synology `SYNO.Core.Share` delete API.
+It does not preflight or postflight list shares. Do not retry blindly after a transport
+timeout because the deletion outcome may be unknown. DSM-specific behavior for the
+share's contents, special shares, and active dependencies is determined by the NAS API
+and is not inferred by this command.
+
 ## Create-share plan mode
 
 Without `--yes`, `create-share` validates arguments and prints a local plan:
@@ -350,7 +375,7 @@ or retry.
 | `0` | Success |
 | `2` | Command-line syntax or usage error |
 | `10` | Configuration or validation failure |
-| `11` | Validated local create plan; no mutation performed |
+| `11` | Validated local create or delete plan; no mutation performed |
 | `20` | Authentication or authorization failure |
 | `30` | Transport, TLS, or network failure |
 | `40` | Synology API or malformed-response failure |

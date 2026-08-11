@@ -27,6 +27,8 @@ from synology.models import (
     ShareCreateOptions,
     ShareCreateRequest,
     ShareCreateResult,
+    ShareDeleteRequest,
+    ShareDeleteResult,
     ShareOperationStep,
     ShareRecord,
 )
@@ -39,12 +41,17 @@ class FakeClient:
         error: Exception | None = None,
         create_result: ShareCreateResult | None = None,
         create_error: Exception | None = None,
+        delete_result: ShareDeleteResult | None = None,
+        delete_error: Exception | None = None,
     ) -> None:
         self.shares = shares
         self.error = error
         self.create_result = create_result
         self.create_error = create_error
+        self.delete_result = delete_result
+        self.delete_error = delete_error
         self.create_requests: list[ShareCreateRequest] = []
+        self.delete_requests: list[ShareDeleteRequest] = []
 
     def list_shares(self) -> tuple[ShareRecord, ...]:
         if self.error is not None:
@@ -58,6 +65,14 @@ class FakeClient:
         if self.create_result is None:
             raise AssertionError("unexpected create-share invocation")
         return self.create_result
+
+    def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult:
+        self.delete_requests.append(request)
+        if self.delete_error is not None:
+            raise self.delete_error
+        if self.delete_result is None:
+            raise AssertionError("unexpected delete-share invocation")
+        return self.delete_result
 
 
 class CapturingFactory:
@@ -203,6 +218,96 @@ def test_omitted_port_uses_5001() -> None:
     assert stderr.getvalue() == ""
     assert factory.config is not None
     assert factory.config.port == 5001
+
+
+def test_delete_share_without_yes_returns_local_plan_without_client() -> None:
+    client = FakeClient()
+    factory = CapturingFactory(client)
+
+    result, stdout, stderr = _run(
+        ["delete-share", "media", "--output", "json"],
+        factory,
+        environment={},
+    )
+
+    assert result == 11
+    assert json.loads(stdout.getvalue()) == {
+        "name": "media",
+        "deleted": False,
+        "steps": [{"name": "delete", "status": "planned"}],
+    }
+    assert stderr.getvalue() == ""
+    assert factory.config is None
+    assert client.delete_requests == []
+
+
+def test_delete_share_with_yes_invokes_client() -> None:
+    client = FakeClient(
+        delete_result=ShareDeleteResult(
+            name="media",
+            deleted=True,
+            steps=(
+                ShareOperationStep(name="delete", status=OperationStatus.SUCCEEDED),
+            ),
+        )
+    )
+    factory = CapturingFactory(client)
+
+    result, stdout, stderr = _run(
+        ["delete-share", "media", "--yes", "--output", "json"],
+        factory,
+    )
+
+    assert result == 0
+    assert json.loads(stdout.getvalue()) == {
+        "name": "media",
+        "deleted": True,
+        "steps": [{"name": "delete", "status": "succeeded"}],
+    }
+    assert stderr.getvalue() == ""
+    assert client.delete_requests == [ShareDeleteRequest(name="media")]
+
+
+@pytest.mark.parametrize("name", ["", "bad/name", ".", "..", "bad\nname"])
+def test_delete_share_invalid_name_returns_validation_error(name: str) -> None:
+    factory = CapturingFactory(FakeClient())
+
+    result, stdout, stderr = _run(
+        ["delete-share", name],
+        factory,
+        environment={},
+    )
+
+    assert result == 10
+    assert stdout.getvalue() == ""
+    assert "share name" in stderr.getvalue()
+    assert factory.config is None
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exit"),
+    [
+        (AuthenticationError("authentication failed"), 20),
+        (TransportError("transport failed"), 30),
+        (ApiError("api failed"), 40),
+        (OutputError("output failed"), 50),
+        (RuntimeError("unexpected"), 70),
+    ],
+)
+def test_delete_share_maps_client_failures_to_exit_codes(
+    error: Exception,
+    expected_exit: int,
+) -> None:
+    factory = CapturingFactory(FakeClient(delete_error=error))
+
+    result, stdout, stderr = _run(
+        ["delete-share", "media", "--yes"],
+        factory,
+    )
+
+    assert result == expected_exit
+    assert stdout.getvalue() == ""
+    assert "error:" in stderr.getvalue()
 
 
 def test_create_share_permission_plan_requires_no_credentials() -> None:
@@ -924,6 +1029,7 @@ def test_broken_output_returns_output_exit_code() -> None:
         (["create-share", "--help"], "local-user:alice:read-write"),
         (["create-share", "--help"], "client=10.192.10.0/24,access=read-write"),
         (["create-share", "--help"], "--yes"),
+        (["delete-share", "--help"], "--yes"),
     ],
 )
 def test_help_contains_descriptions_and_examples(

@@ -16,6 +16,7 @@ from synology.models import (
     RecycleBinOptions,
     ShareCreateOptions,
     ShareCreateRequest,
+    ShareDeleteRequest,
 )
 
 QUOTA_MIB_PER_GIB = 1024
@@ -125,6 +126,17 @@ def validate_permission_specs(
             "conflicting permission specifications are not allowed"
         )
     return permissions
+
+
+def validate_share_delete_request(request: ShareDeleteRequest) -> ShareDeleteRequest:
+    name = request.name.strip()
+    if not name:
+        raise ConfigurationError("share name must not be empty")
+    if name in {".", ".."} or any(character in {"/", "\\"} for character in name):
+        raise ConfigurationError("share name contains invalid characters")
+    if _contains_control_characters(name):
+        raise ConfigurationError("share name contains invalid characters")
+    return ShareDeleteRequest(name=name)
 
 
 def validate_share_create_request(request: ShareCreateRequest) -> ShareCreateRequest:

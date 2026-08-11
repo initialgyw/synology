@@ -9,6 +9,7 @@ from synology.config import (
     validate_nfs_permission_specs,
     validate_permission_specs,
     validate_share_create_request,
+    validate_share_delete_request,
 )
 from synology.exceptions import (
     ApiError,
@@ -30,11 +31,18 @@ from synology.models import (
     ShareCreateOptions,
     ShareCreateRequest,
     ShareCreateResult,
+    ShareDeleteRequest,
+    ShareDeleteResult,
     ShareDetails,
     ShareOperationStep,
     ShareRecord,
 )
-from synology.output import render_share_create, render_share_details, render_shares
+from synology.output import (
+    render_share_create,
+    render_share_delete,
+    render_share_details,
+    render_shares,
+)
 from synology.shares import SynShareClient
 
 
@@ -44,6 +52,8 @@ class ShareClient(Protocol):
     def list_share_details(self) -> tuple[ShareDetails, ...]: ...
 
     def create_share(self, request: ShareCreateRequest) -> ShareCreateResult: ...
+
+    def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult: ...
 
 
 class ShareClientFactory(Protocol):
@@ -87,12 +97,34 @@ def run(
 
     logger = configure_logging(arguments.verbose, stream=stderr)
     try:
+        if arguments.command is Command.DELETE_SHARE:
+            delete_request = validate_share_delete_request(
+                ShareDeleteRequest(name=arguments.name)
+            )
+            if not arguments.confirm:
+                _write_output(
+                    render_share_delete(
+                        ShareDeleteResult(
+                            name=delete_request.name,
+                            deleted=False,
+                            steps=(
+                                ShareOperationStep(
+                                    name="delete", status=OperationStatus.PLANNED
+                                ),
+                            ),
+                        ),
+                        arguments.output,
+                    ),
+                    stdout,
+                )
+                return 11
         if arguments.command is Command.CREATE_SHARE:
             if arguments.disable_recycle_bin and arguments.recycle_bin_user_access:
                 raise ConfigurationError(
                     "--disable-recycle-bin cannot be combined with "
                     "--recycle-bin-user-access"
                 )
+
             permissions = validate_permission_specs(arguments.permission_specs)
             nfs_permissions = validate_nfs_permission_specs(
                 arguments.nfs_permission_specs
@@ -144,6 +176,10 @@ def run(
         if arguments.command is Command.CREATE_SHARE:
             rendered = render_share_create(
                 client.create_share(request), arguments.output
+            )
+        elif arguments.command is Command.DELETE_SHARE:
+            rendered = render_share_delete(
+                client.delete_share(delete_request), arguments.output
             )
         else:
             if arguments.permissions:
@@ -213,13 +249,16 @@ def _build_parser() -> _CliArgumentParser:
             "Examples:\n"
             "  syn-cli list-shares --output json\n"
             "  syn-cli create-share projects --path /volume1\n"
-            "  syn-cli create-share projects --path /volume1 --yes\n"
+             "  syn-cli create-share projects --path /volume1 --yes\n"
+             "  syn-cli delete-share projects --yes\n"
+
             "  syn-cli create-share projects --path /volume1 "
             "--permission 'local-user:alice:read-write' --yes\n"
             "  syn-cli create-share nfs-data --path /volume1 "
             "--nfs-permission 'client=10.192.10.0/24,access=read-write' --yes\n\n"
-            "Create operations require --yes to contact the NAS; without it, "
-            "a local plan is printed and exit code 11 is returned."
+             "Create and delete operations require --yes to contact the NAS; "
+             "without it, a local plan is printed and exit code 11 is returned."
+
         ),
     )
     _add_global_options(parser)
@@ -332,6 +371,29 @@ def _build_parser() -> _CliArgumentParser:
         help="Confirm NAS mutation; without it, print a local plan and exit 11.",
     )
     create_share.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    delete_share = subparsers.add_parser(
+        "delete-share",
+        help="Delete a shared folder.",
+        description=(
+            "Delete a shared folder by exact name. Without --yes, validate and "
+            "print a local plan without contacting the NAS."
+        ),
+    )
+    _add_global_options(delete_share)
+    delete_share.add_argument("name", help="Shared-folder name to delete.")
+    delete_share.add_argument(
+        "--yes",
+        dest="confirm",
+        action="store_true",
+        help="Confirm NAS mutation; without it, print a local plan and exit 11.",
+    )
+    delete_share.add_argument(
         "-o",
         "--output",
         choices=tuple(item.value for item in OutputFormat),

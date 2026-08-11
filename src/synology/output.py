@@ -10,6 +10,7 @@ from synology.models import (
     NfsClientPermission,
     OutputFormat,
     ShareCreateResult,
+    ShareDeleteResult,
     ShareDetails,
     ShareRecord,
 )
@@ -98,6 +99,47 @@ def render_share_create(result: ShareCreateResult, output_format: OutputFormat) 
                 str(len(result.nfs_permissions)) if result.nfs_permissions else "-",
                 "created" if result.created else "planned",
             ]
+            widths = [
+                max(len(header), len(value))
+                for header, value in zip(headers, values, strict=True)
+            ]
+            return "\n".join(
+                [
+                    "  ".join(
+                        header.ljust(width)
+                        for header, width in zip(headers, widths, strict=True)
+                    ),
+                    "  ".join("-" * width for width in widths),
+                    "  ".join(
+                        value.ljust(width)
+                        for value, width in zip(values, widths, strict=True)
+                    ),
+                ]
+            )
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
+
+
+def render_share_delete(result: ShareDeleteResult, output_format: OutputFormat) -> str:
+    try:
+        record = {
+            "name": result.name,
+            "deleted": result.deleted,
+            "steps": [
+                {
+                    "name": step.name,
+                    "status": step.status.value,
+                    **({"message": step.message} if step.message is not None else {}),
+                }
+                for step in result.steps
+            ],
+        }
+        if output_format is OutputFormat.TABLE:
+            headers = ["NAME", "STATUS"]
+            values = [result.name, "deleted" if result.deleted else "planned"]
             widths = [
                 max(len(header), len(value))
                 for header, value in zip(headers, values, strict=True)
