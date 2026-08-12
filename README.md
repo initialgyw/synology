@@ -439,6 +439,46 @@ verification returns `60` with its completed and failed steps in the output. In 
 do not retry a quota request after a transport failure or malformed post-write response:
 the NAS may have accepted it, and the output marks the outcome as unknown.
 
+## Config import
+
+`config-import` reads exactly one existing live share using read-only NAS methods and merges
+it into an existing strict V1 configuration. It never creates, changes, or deletes a NAS
+share.
+
+```bash
+syn-cli config-import -c config.yaml projects
+syn-cli config-import -c config.yaml projects --yes --output json
+```
+
+`-c`/`--config` is required and the file must already exist. The default is a preview: it
+prints the final unified diff (`current-config.yaml` to `proposed-config.yaml`) and does not
+write the file. `--yes` prints that same diff and atomically replaces only the local config,
+without a prompt or NAS mutation. Table output contains the readable diff; JSON and YAML
+contain metadata plus a `diff` string. The command always merges and round-trip serializes a
+proposed document in memory. It reports no change and never rewrites the file, including with
+`--yes`, only when that serialized text exactly matches the original file; retained comments or
+formatting that produce a real serialized diff require `--yes` to write.
+
+The command validates duplicate keys and all present V1 root and managed structures before
+resolving credentials or constructing a NAS client. As the sole config-import exception, a root
+with valid `version: 1` but no `volumes` is accepted so the import can create `volumes`; every
+serialized proposal is then strict V1-valid. It replaces the target share node with
+live description, quota, mutable ACLs, and complete supported NFS rules; it creates missing
+`volumes`, creates the live
+volume when needed, moves a target configured under another volume, and preserves supported
+root fields, volumes, shares, comments, and formatting where possible. The protected exact
+`local_group:administrators:read-write` ACL is omitted. Live quota must be unlimited or a
+nonnegative, exactly GiB-aligned value within both the DSM API MiB maximum and the supported
+GiB maximum. A malformed or oversized live quota is a remote-response representability failure
+and returns exit `40`; NFS clients must be valid and NFS security must be exactly `[sys]`.
+Unsupported or malformed live state aborts before any local write.
+
+For this command, config `host` takes precedence over `--host`, then `SYN_HOST`; if absent,
+the selected CLI/environment host is inserted into the proposed config. Username and password
+remain `--username` then their environment variables. `--yes` rejects symlink and non-regular
+targets and uses a same-directory atomic write preserving the target mode, fsyncing data and
+the directory when supported. Local persistence failures return exit `12`.
+
 ## Exit codes and remediation
 
 | Code | Meaning |
@@ -447,6 +487,7 @@ the NAS may have accepted it, and the output marks the outcome as unknown.
 | `2` | Command-line syntax or usage error |
 | `10` | Configuration or validation failure |
 | `11` | Validated local create, delete, or modify plan; no mutation performed |
+| `12` | Local config-import persistence failure |
 | `20` | Authentication or authorization failure |
 | `30` | Transport, TLS, or network failure |
 | `40` | Synology API or malformed-response failure |

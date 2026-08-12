@@ -17,6 +17,7 @@ class Command(StrEnum):
     DELETE_SHARE = "delete-share"
     MODIFY_SHARE = "modify-share"
     APPLY_CONFIG = "apply-config"
+    CONFIG_IMPORT = "config-import"
 
 
 class OperationStatus(StrEnum):

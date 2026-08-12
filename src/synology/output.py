@@ -4,6 +4,7 @@ from collections.abc import Sequence
 import yaml
 
 from synology.apply_config import ApplyPlan
+from synology.config_import import ConfigImportResult
 from synology.exceptions import OutputError
 from synology.models import (
     AclPermissionRecord,
@@ -20,6 +21,43 @@ from synology.models import (
     ShareOperationStep,
     ShareRecord,
 )
+
+
+def render_config_import(
+    result: ConfigImportResult, output_format: OutputFormat
+) -> str:
+    """Render config-import metadata and its reviewed unified diff."""
+    try:
+        record = {
+            "share": result.share,
+            "host": result.host,
+            "action": result.action,
+            "written": result.written,
+            "diff": result.diff,
+        }
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        if output_format is OutputFormat.YAML:
+            return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+        if not result.diff:
+            return "\n".join(
+                [
+                    f"SHARE: {result.share}",
+                    f"HOST: {result.host}",
+                    "ACTION: no-change",
+                    "No changes.",
+                ]
+            )
+        return "\n".join(
+            [
+                f"SHARE: {result.share}",
+                f"HOST: {result.host}",
+                f"ACTION: {result.action}",
+                result.diff.rstrip("\n"),
+            ]
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
 
 
 def render_apply_plan(

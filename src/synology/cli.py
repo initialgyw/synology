@@ -20,12 +20,18 @@ from synology.config import (
     validate_share_delete_request,
     validate_share_modify_request,
 )
+from synology.config_import import (
+    ConfigImportClient,
+    import_share_config,
+    load_config_import_document,
+)
 from synology.exceptions import (
     ApiError,
     AuthenticationError,
     ConfigurationError,
     OutputError,
     PartialOperationError,
+    PersistenceError,
     PrincipalNotFoundError,
     TransportError,
     UnexpectedApplicationError,
@@ -54,6 +60,7 @@ from synology.models import (
 from synology.output import (
     apply_plan_warnings,
     render_apply_plan,
+    render_config_import,
     render_share_create,
     render_share_delete,
     render_share_details,
@@ -117,6 +124,31 @@ def run(
     logger = configure_logging(arguments.verbose, stream=stderr)
     selected_host = ""
     try:
+        if arguments.command is Command.CONFIG_IMPORT:
+            document = load_config_import_document(arguments.config_path)
+            import_arguments = replace(
+                arguments,
+                host=document.config.host
+                if document.config.host is not None
+                else arguments.host,
+            )
+            config = resolve_connection_config(import_arguments, environ=environ)
+            selected_host = config.host
+            if config.insecure:
+                logger.warning("TLS certificate verification is disabled")
+            factory = (
+                _default_client_factory if client_factory is None else client_factory
+            )
+            client = factory(config, logger)
+            import_result = import_share_config(
+                document,
+                share_name=arguments.name,
+                host=config.host,
+                client=cast(ConfigImportClient, client),
+                write=arguments.confirm,
+            )
+            _write_output(render_config_import(import_result, arguments.output), stdout)
+            return 0
         if arguments.command is Command.APPLY_CONFIG:
             apply_config = load_apply_config(arguments.config_path)
             apply_arguments = replace(
@@ -338,6 +370,9 @@ def run(
             return 50
         _write_error(str(exc), stderr)
         return 60
+    except PersistenceError as exc:
+        _write_error(str(exc), stderr)
+        return 12
     except OutputError as exc:
         _write_error(str(exc), stderr)
         return 50
@@ -564,6 +599,36 @@ def _build_parser() -> _CliArgumentParser:
         help="Confirm NAS mutation; without it, print a local plan and exit 11.",
     )
     delete_share.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    config_import = subparsers.add_parser(
+        "config-import",
+        help="Import one live share into a local V1 YAML configuration.",
+        description=(
+            "Preview a read-only NAS import; --yes atomically writes only the "
+            "local file."
+        ),
+    )
+    _add_global_options(config_import)
+    config_import.add_argument("name", help="Exact live shared-folder name to import.")
+    config_import.add_argument(
+        "-c",
+        "--config",
+        dest="config_path",
+        required=True,
+        help="Existing V1 YAML configuration path.",
+    )
+    config_import.add_argument(
+        "--yes",
+        dest="confirm",
+        action="store_true",
+        help="Atomically write the reviewed local configuration without a prompt.",
+    )
+    config_import.add_argument(
         "-o",
         "--output",
         choices=tuple(item.value for item in OutputFormat),

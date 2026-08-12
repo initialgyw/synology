@@ -39,6 +39,14 @@ class OutputError(SynologyCliError):
     pass
 
 
+class PersistenceError(SynologyCliError):
+    pass
+
+
+class LocalPersistenceError(PersistenceError):
+    pass
+
+
 class PartialOperationError(SynologyCliError):
     def __init__(self, message: str, result: object) -> None:
         super().__init__(message)

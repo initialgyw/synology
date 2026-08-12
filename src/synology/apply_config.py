@@ -100,10 +100,17 @@ class ApplyClient(Protocol):
 def load_apply_config(path: str) -> ApplyConfig:
     """Load and strictly validate a V1 apply-config document."""
     try:
-        loaded = yaml.load(
-            Path(path).read_text(encoding="utf-8"), Loader=_UniqueKeyLoader
-        )
-    except (OSError, yaml.YAMLError) as exc:
+        source = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigurationError("unable to load apply configuration") from exc
+    return parse_apply_config(source)
+
+
+def parse_apply_config(source: str) -> ApplyConfig:
+    """Parse and strictly validate V1 configuration source text."""
+    try:
+        loaded = yaml.load(source, Loader=_UniqueKeyLoader)
+    except yaml.YAMLError as exc:
         raise ConfigurationError("unable to load apply configuration") from exc
     root = _mapping(loaded, "configuration root")
     _keys(
