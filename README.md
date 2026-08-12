@@ -22,6 +22,13 @@ mypy
 The packaged command is `syn-cli`. It uses the pinned
 [N4S4/synology-api](https://github.com/N4S4/synology-api) v0.9.2 upstream.
 
+## Continuous integration and releases
+
+Pull requests run Ruff and the pytest suite on Python 3.12 through GitHub Actions.
+When a pull request is merged into `main`, another workflow reads the project version
+from `pyproject.toml` and creates the corresponding `v<version>` tag. Existing tags are
+never force-updated; a conflicting tag causes the workflow to fail.
+
 ## Credentials and global options
 
 Required connection values can be supplied as options or environment variables:
