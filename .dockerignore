@@ -1,0 +1,10 @@
+.git
+.github
+.opencode
+.venv
+__pycache__
+*.pyc
+credentials.json
+config.yaml
+tests
+dist
