@@ -904,27 +904,22 @@ def test_create_share_applies_and_verifies_complete_acl() -> None:
     assert result.steps[-1].status is OperationStatus.SUCCEEDED
 
 
-def test_acl_normalization_filters_default_entries_but_keeps_custom_unknown() -> None:
+def test_acl_normalization_renders_active_noncustom_ldap_and_excludes_inventory() -> (
+    None
+):
     response = _permission_response(
         [
             {
-                "name": "admin",
+                "name": "konri@jumpcloud.com",
                 "is_custom": False,
-                "is_admin": True,
-                "is_deny": False,
-                "is_readonly": False,
-                "is_writable": False,
-            },
-            {
-                "name": "alice",
-                "is_custom": True,
                 "is_admin": False,
                 "is_deny": False,
                 "is_readonly": False,
-                "is_writable": False,
+                "is_writable": True,
             },
             {
-                "name": "guest",
+                "name": "unused",
+                "is_custom": True,
                 "is_admin": False,
                 "is_deny": False,
                 "is_readonly": False,
@@ -944,9 +939,9 @@ def test_acl_normalization_filters_default_entries_but_keeps_custom_unknown() ->
         factory=FakeFactory(share),
         permission_factory=lambda _: FakePermissionApi(
             {
-                "local_user": response,
+                "local_user": _permission_response([]),
                 "local_group": _permission_response([]),
-                "ldap_user": _permission_response([]),
+                "ldap_user": response,
                 "ldap_group": _permission_response([]),
             }
         ),
@@ -959,8 +954,9 @@ def test_acl_normalization_filters_default_entries_but_keeps_custom_unknown() ->
 
     details = client.list_share_details()
 
-    assert [item.name for item in details[0].acl_permissions] == ["alice"]
-    assert details[0].acl_permissions[0].is_custom is True
+    assert [item.name for item in details[0].acl_permissions] == ["konri@jumpcloud.com"]
+    assert details[0].acl_permissions[0].category == "ldap_user"
+    assert details[0].acl_permissions[0].is_custom is False
 
 
 def test_permission_failure_after_creation_is_partial_operation() -> None:

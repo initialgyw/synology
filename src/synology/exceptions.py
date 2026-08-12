@@ -1,3 +1,9 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from synology.models import AclPrincipal
+
+
 class SynologyCliError(Exception):
     pass
 
@@ -16,6 +22,17 @@ class TransportError(SynologyCliError):
 
 class ApiError(SynologyCliError):
     pass
+
+
+class PrincipalNotFoundError(SynologyCliError):
+    def __init__(self, missing: tuple["AclPrincipal", ...]) -> None:
+        self.missing = missing
+        identities = ", ".join(
+            f"{principal.category}:{principal.name}" for principal in missing
+        )
+        super().__init__(
+            f"requested permission principals were not found: {identities}"
+        )
 
 
 class OutputError(SynologyCliError):

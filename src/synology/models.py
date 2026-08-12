@@ -15,6 +15,7 @@ class Command(StrEnum):
     LIST_SHARES = "list-shares"
     CREATE_SHARE = "create-share"
     DELETE_SHARE = "delete-share"
+    MODIFY_SHARE = "modify-share"
 
 
 class OperationStatus(StrEnum):
@@ -123,6 +124,7 @@ class CliArguments:
     recycle_bin_user_access: bool = False
     compress: bool = False
     quota_gib: int | None = None
+    quota_values: tuple[int, ...] = ()
     permission_specs: tuple[str, ...] = ()
     nfs_permission_specs: tuple[str, ...] = ()
     permissions: bool = False
@@ -162,6 +164,60 @@ class ShareDeleteRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ShareModifyRequest:
+    name: str
+    quota_gib: int | None = None
+    permissions: tuple[PermissionSpec, ...] | None = None
+    nfs_permissions: tuple[NfsClientPermission, ...] | None = None
+    _acl_clear_mode: bool = field(default=False, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ShareQuotaState:
+    api_value: int
+    api_unit: str = "MiB"
+
+    @property
+    def unlimited(self) -> bool:
+        return self.api_value == 0
+
+    @property
+    def gib(self) -> float | None:
+        return None if self.unlimited else self.api_value / 1024
+
+
+@dataclass(frozen=True, slots=True)
+class MutableShareState:
+    name: str
+    volume_path: str
+    description: str
+    hidden: bool
+    recycle_bin_enabled: bool
+    recycle_bin_admin_only: bool
+    compression_enabled: bool
+    cow_enabled: bool
+    quota: ShareQuotaState
+
+
+@dataclass(frozen=True, slots=True)
+class ShareQuotaSetPayload:
+    name: str
+    version: int
+    shareinfo: str
+
+
+@dataclass(frozen=True, slots=True)
+class ShareModifyResult:
+    name: str
+    changed: bool
+    quota_gib: int | None = None
+    observed_quota: ShareQuotaState | None = None
+    permissions: tuple[PermissionSpec, ...] | None = None
+    nfs_permissions: tuple[NfsClientPermission, ...] | None = None
+    steps: tuple[ShareOperationStep, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ShareDeleteResult:
     name: str
     deleted: bool
@@ -189,6 +245,28 @@ class AclPermissionRecord:
     is_writable: bool
     is_custom: bool
     is_admin: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AclPrincipal:
+    name: str
+    category: str
+
+
+@dataclass(frozen=True, slots=True)
+class AclPermissionState:
+    name: str
+    category: str
+    access_mode: PermissionAccessMode
+    is_custom: bool
+    is_admin: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AclPermissionInventory:
+    category: str
+    principals: tuple[AclPrincipal, ...]
+    active_permissions: tuple[AclPermissionState, ...]
 
 
 @dataclass(frozen=True, slots=True)

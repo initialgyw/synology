@@ -14,20 +14,29 @@ from synology_api.exceptions import (
     UndefinedError,
 )
 
-from synology.config import normalize_nfs_client
+from synology.config import (
+    QUOTA_MIB_PER_GIB,
+    normalize_nfs_client,
+    validate_share_modify_request,
+)
 from synology.exceptions import (
     ApiError,
     AuthenticationError,
     ConfigurationError,
     PartialOperationError,
+    PrincipalNotFoundError,
     TransportError,
 )
 from synology.logging import sanitize
 from synology.models import (
+    AclPermissionInventory,
     AclPermissionRecord,
+    AclPermissionState,
+    AclPrincipal,
     ConnectionConfig,
     EnrichmentDiagnostic,
     EnrichmentStatus,
+    MutableShareState,
     NfsAccessMode,
     NfsClientPermission,
     NfsSecurityFlavor,
@@ -42,13 +51,18 @@ from synology.models import (
     ShareDeleteResult,
     ShareDetails,
     ShareListRequest,
+    ShareModifyRequest,
+    ShareModifyResult,
     ShareOperationStep,
+    ShareQuotaSetPayload,
+    ShareQuotaState,
     ShareRecord,
 )
 
 SHARE_OPERATION = "SYNO.Core.Share.list"
 CREATE_OPERATION = "SYNO.Core.Share.create"
 DELETE_OPERATION = "SYNO.Core.Share.delete"
+SHARE_SET_API = "SYNO.Core.Share"
 
 
 class ShareApi(Protocol):
@@ -78,6 +92,20 @@ class ShareApi(Protocol):
     ) -> object: ...
 
     def delete_folders(self, name: list[str]) -> object: ...
+
+    def get_folder(self, name: str, additional: list[str]) -> object: ...
+
+
+class ShareQuotaRawApi(ShareApi, Protocol):
+    core_list: Mapping[str, Mapping[str, object]]
+
+    def request_data(
+        self,
+        api_name: str,
+        api_path: str,
+        req_param: dict[str, object],
+        method: str,
+    ) -> object: ...
 
 
 class SharePermissionApi(Protocol):
@@ -289,6 +317,378 @@ class SynShareClient:
         )
         return result
 
+    def modify_share(self, request: ShareModifyRequest) -> ShareModifyResult:
+        request = validate_share_modify_request(request)
+        if request.quota_gib is not None:
+            return self._modify_quota(request)
+        if request.permissions is not None:
+            return self._modify_permissions(request)
+        if request.nfs_permissions is not None:
+            return self._modify_nfs_permissions(request)
+        raise ConfigurationError("exactly one modification family must be selected")
+
+    def _modify_quota(self, request: ShareModifyRequest) -> ShareModifyResult:
+        assert request.quota_gib is not None
+        api = cast(ShareQuotaRawApi, self._share)
+        try:
+            version = _share_set_version(api)
+            current = _read_mutable_share_state(api, request.name)
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="quota-preflight")
+        desired_api_value = request.quota_gib * QUOTA_MIB_PER_GIB
+        if current.quota.api_value == desired_api_value:
+            return ShareModifyResult(
+                name=request.name,
+                changed=False,
+                quota_gib=request.quota_gib,
+                observed_quota=current.quota,
+                steps=(
+                    ShareOperationStep(
+                        name="quota",
+                        status=OperationStatus.SKIPPED,
+                        message="quota already matches requested value",
+                    ),
+                ),
+            )
+        payload = _quota_set_payload(current, version, desired_api_value)
+        try:
+            response = api.request_data(
+                SHARE_SET_API,
+                cast(str, api.core_list[SHARE_SET_API]["path"]),
+                {
+                    "version": payload.version,
+                    "method": "set",
+                    "name": payload.name,
+                    "shareinfo": payload.shareinfo,
+                },
+                method="post",
+            )
+        except Exception as exc:
+            self._raise_quota_write_failure(exc, request)
+        envelope = _quota_set_envelope(response)
+        if envelope is None:
+            self._raise_quota_partial_failure(
+                ApiError("invalid share quota set response"),
+                request,
+                [],
+                "quota set response was malformed",
+                step_name="quota:set",
+            )
+        if envelope.get("success") is False:
+            raise ApiError("NAS API returned an unsuccessful share quota set response")
+        if envelope.get("success") is not True:
+            self._raise_quota_partial_failure(
+                ApiError("invalid share quota set response"),
+                request,
+                [],
+                "quota set response was malformed",
+                step_name="quota:set",
+            )
+        steps = [ShareOperationStep(name="quota:set", status=OperationStatus.SUCCEEDED)]
+        try:
+            observed = _read_mutable_share_state(api, request.name)
+        except Exception as exc:
+            self._raise_quota_partial_failure(
+                exc,
+                request,
+                steps,
+                "quota verification did not complete",
+            )
+        if observed.quota.api_value != desired_api_value or not _share_state_preserved(
+            current, observed
+        ):
+            steps.append(
+                ShareOperationStep(
+                    name="quota:verify",
+                    status=OperationStatus.FAILED,
+                    message="quota or preserved share state did not match read-back",
+                )
+            )
+            raise PartialOperationError(
+                "share quota modification verification failed",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    quota_gib=request.quota_gib,
+                    observed_quota=observed.quota,
+                    steps=tuple(steps),
+                ),
+            )
+        steps.append(
+            ShareOperationStep(name="quota:verify", status=OperationStatus.SUCCEEDED)
+        )
+        return ShareModifyResult(
+            name=request.name,
+            changed=True,
+            quota_gib=request.quota_gib,
+            observed_quota=observed.quota,
+            steps=tuple(steps),
+        )
+
+    def _raise_quota_write_failure(
+        self, exc: Exception, request: ShareModifyRequest
+    ) -> NoReturn:
+        if isinstance(exc, ApiError):
+            raise exc
+        if isinstance(exc, (CoreError, UndefinedError, SynoBaseException)):
+            raise ApiError("NAS API request failed") from exc
+        self._raise_quota_partial_failure(
+            exc,
+            request,
+            [],
+            "quota set request outcome is unknown",
+            step_name="quota:set",
+        )
+
+    def _raise_quota_partial_failure(
+        self,
+        exc: Exception,
+        request: ShareModifyRequest,
+        steps: list[ShareOperationStep],
+        message: str,
+        step_name: str = "quota:verify",
+    ) -> NoReturn:
+        status = _quota_failure_status(exc)
+        steps.append(ShareOperationStep(name=step_name, status=status, message=message))
+        raise PartialOperationError(
+            "share quota modification outcome is uncertain",
+            ShareModifyResult(
+                name=request.name,
+                changed=True,
+                quota_gib=request.quota_gib,
+                steps=tuple(steps),
+            ),
+        ) from exc
+
+    def _modify_permissions(self, request: ShareModifyRequest) -> ShareModifyResult:
+        try:
+            api = self._permission_api()
+            inventory = _read_modify_permission_inventory(api, request.name)
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="permission-preflight")
+        if request.permissions is not None:
+            _validate_requested_principals(inventory, request.permissions)
+        current = _active_modify_permissions(inventory)
+        desired = request.permissions
+        assert desired is not None
+        deltas = _permission_deltas(
+            current, desired, clear_mode=request._acl_clear_mode
+        )
+        if (
+            _compare_modify_permissions(
+                current, desired, clear_mode=request._acl_clear_mode
+            )
+            is None
+        ):
+            return ShareModifyResult(
+                name=request.name,
+                changed=False,
+                permissions=request.permissions,
+                steps=tuple(
+                    ShareOperationStep(
+                        name=f"permissions:{category}",
+                        status=OperationStatus.SKIPPED,
+                        message="no ACL delta",
+                        permission_status=PermissionStatus.VERIFIED,
+                    )
+                    for category in PERMISSION_USER_GROUP_TYPES
+                ),
+            )
+        steps: list[ShareOperationStep] = []
+        for category in PERMISSION_USER_GROUP_TYPES:
+            delta, desired_count, revoked_count = deltas[category]
+            if not delta:
+                steps.append(
+                    ShareOperationStep(
+                        name=f"permissions:{category}",
+                        status=OperationStatus.SKIPPED,
+                        message="no ACL delta",
+                        permission_status=PermissionStatus.UNVERIFIED,
+                    )
+                )
+                continue
+            message = f"desired={desired_count} revoked={revoked_count}"
+            try:
+                _set_permissions(api, request.name, category, delta)
+            except Exception as exc:
+                status = _permission_failure_status(exc)
+                steps.append(
+                    ShareOperationStep(
+                        name=f"permissions:{category}",
+                        status=status,
+                        message=f"ACL delta did not complete ({message})",
+                        permission_status=_permission_status(status),
+                    )
+                )
+                raise PartialOperationError(
+                    "share permission modification is uncertain",
+                    ShareModifyResult(
+                        name=request.name,
+                        changed=True,
+                        permissions=desired,
+                        steps=tuple(steps),
+                    ),
+                ) from exc
+            steps.append(
+                ShareOperationStep(
+                    name=f"permissions:{category}",
+                    status=OperationStatus.SUCCEEDED,
+                    message=message,
+                    permission_status=PermissionStatus.UNVERIFIED,
+                )
+            )
+        try:
+            mismatch = _compare_modify_permissions(
+                _active_modify_permissions(
+                    _read_modify_permission_inventory(api, request.name)
+                ),
+                desired,
+                clear_mode=request._acl_clear_mode,
+            )
+        except Exception as exc:
+            status = _permission_failure_status(exc)
+            steps.append(
+                ShareOperationStep(
+                    name="permissions:verify",
+                    status=status,
+                    message="ACL replacement verification did not complete",
+                    permission_status=_permission_status(status),
+                )
+            )
+            raise PartialOperationError(
+                "share permission modification verification is uncertain",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    permissions=desired,
+                    steps=tuple(steps),
+                ),
+            ) from exc
+        if mismatch is not None:
+            steps.append(
+                ShareOperationStep(
+                    name="permissions:verify",
+                    status=OperationStatus.FAILED,
+                    message=f"ACL replacement mismatch: {mismatch}",
+                    permission_status=PermissionStatus.FAILED,
+                )
+            )
+            raise PartialOperationError(
+                "share permission modification verification failed",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    permissions=desired,
+                    steps=tuple(steps),
+                ),
+            )
+        steps.append(
+            ShareOperationStep(
+                name="permissions:verify",
+                status=OperationStatus.SUCCEEDED,
+                permission_status=PermissionStatus.VERIFIED,
+            )
+        )
+        return ShareModifyResult(
+            name=request.name,
+            changed=True,
+            permissions=desired,
+            steps=tuple(steps),
+        )
+
+    def _modify_nfs_permissions(self, request: ShareModifyRequest) -> ShareModifyResult:
+        assert request.nfs_permissions is not None
+        try:
+            api = self._nfs_api()
+            if not _global_nfs_enabled(api):
+                raise ConfigurationError("global NFS must already be enabled")
+            current = _load_nfs_rules(api, request.name)
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="nfs-preflight")
+        if _nfs_rules_match(request.nfs_permissions, current):
+            return ShareModifyResult(
+                name=request.name,
+                changed=False,
+                nfs_permissions=request.nfs_permissions,
+                steps=(
+                    ShareOperationStep(
+                        name="nfs",
+                        status=OperationStatus.SKIPPED,
+                        message="NFS rules already match requested replacement",
+                    ),
+                ),
+            )
+        try:
+            _save_nfs_rules(api, request.name, request.nfs_permissions)
+        except Exception as exc:
+            status = _nfs_failure_status(exc)
+            raise PartialOperationError(
+                "share NFS modification is uncertain",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    nfs_permissions=request.nfs_permissions,
+                    steps=(
+                        ShareOperationStep(
+                            name="nfs:save",
+                            status=status,
+                            message="NFS replacement may not have completed",
+                        ),
+                    ),
+                ),
+            ) from exc
+        steps = [ShareOperationStep(name="nfs:save", status=OperationStatus.SUCCEEDED)]
+        try:
+            verified = _nfs_rules_match(
+                request.nfs_permissions, _load_nfs_rules(api, request.name)
+            )
+        except Exception as exc:
+            status = _nfs_failure_status(exc)
+            steps.append(
+                ShareOperationStep(
+                    name="nfs:verify",
+                    status=status,
+                    message="NFS replacement verification did not complete",
+                )
+            )
+            raise PartialOperationError(
+                "share NFS modification verification is uncertain",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    nfs_permissions=request.nfs_permissions,
+                    steps=tuple(steps),
+                ),
+            ) from exc
+        if not verified:
+            steps.append(
+                ShareOperationStep(
+                    name="nfs:verify",
+                    status=OperationStatus.FAILED,
+                    message="NFS read-back did not match requested replacement",
+                )
+            )
+            raise PartialOperationError(
+                "share NFS modification verification failed",
+                ShareModifyResult(
+                    name=request.name,
+                    changed=True,
+                    nfs_permissions=request.nfs_permissions,
+                    steps=tuple(steps),
+                ),
+            )
+        steps.append(
+            ShareOperationStep(name="nfs:verify", status=OperationStatus.SUCCEEDED)
+        )
+        return ShareModifyResult(
+            name=request.name,
+            changed=True,
+            nfs_permissions=request.nfs_permissions,
+            steps=tuple(steps),
+        )
+
     def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult:
         self._logger.debug(
             "Synology API delete request operation=%s target=%s:%s tls_verify=%s "
@@ -345,10 +745,13 @@ class SynShareClient:
             acl_failed = False
             for category in PERMISSION_USER_GROUP_TYPES:
                 try:
-                    response = permission_api.get_folder_permissions(
-                        share.name, user_group_type=category
+                    acl.extend(
+                        entry
+                        for value in _read_permission_category(
+                            permission_api, share.name, category
+                        )
+                        if (entry := _normalize_acl_entry(value, category)) is not None
                     )
-                    acl.extend(_normalize_acl_entries(response, category))
                 except Exception as exc:
                     acl_failed = True
                     diagnostics.append(
@@ -481,6 +884,185 @@ class SynShareClient:
         if isinstance(exc, (CoreError, UndefinedError, SynoBaseException)):
             raise ApiError("NAS API request failed") from exc
         raise exc
+
+
+def _share_set_version(api: ShareQuotaRawApi) -> int:
+    info = api.core_list.get(SHARE_SET_API)
+    if not isinstance(info, Mapping):
+        raise ConfigurationError("NAS does not support share quota updates")
+    path = info.get("path")
+    maximum = info.get("maxVersion")
+    if (
+        not isinstance(path, str)
+        or not path
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum < 1
+    ):
+        raise ConfigurationError("NAS does not support share quota updates")
+    return maximum
+
+
+def _read_mutable_share_state(api: ShareQuotaRawApi, name: str) -> MutableShareState:
+    response = api.get_folder(
+        name,
+        additional=[
+            "share_quota",
+            "hidden",
+            "enable_share_compress",
+            "enable_share_cow",
+        ],
+    )
+    envelope = _as_mapping(response, "invalid share quota read response")
+    if envelope.get("success") is not True:
+        raise ApiError("NAS API returned an unsuccessful share quota read response")
+    data = _as_mapping(envelope.get("data"), "invalid share quota read response data")
+    recycle_bin = _recycle_bin_options(data)
+    if recycle_bin is None:
+        recycle_bin = _listed_recycle_bin_options(api, name)
+    return _mutable_share_state(data, recycle_bin)
+
+
+def _mutable_share_state(
+    data: Mapping[str, object], recycle_bin: tuple[bool, bool]
+) -> MutableShareState:
+    name = _required_string(data, "name")
+    volume_path = _required_string(data, "vol_path")
+    description = _required_string(data, "desc")
+    hidden = _required_boolean(data, "hidden")
+    compression_enabled = _required_boolean(data, "enable_share_compress")
+    cow_enabled = _required_boolean(data, "enable_share_cow")
+    quota = ShareQuotaState(_read_quota_value(data))
+    recycle_bin_enabled, recycle_bin_admin_only = recycle_bin
+    return MutableShareState(
+        name=name,
+        volume_path=volume_path,
+        description=description,
+        hidden=hidden,
+        recycle_bin_enabled=recycle_bin_enabled,
+        recycle_bin_admin_only=recycle_bin_admin_only,
+        compression_enabled=compression_enabled,
+        cow_enabled=cow_enabled,
+        quota=quota,
+    )
+
+
+def _recycle_bin_options(data: Mapping[str, object]) -> tuple[bool, bool] | None:
+    enabled = data.get("enable_recycle_bin")
+    admin_only = data.get("recycle_bin_admin_only")
+    if enabled is None and admin_only is None:
+        return None
+    if not isinstance(enabled, bool) or not isinstance(admin_only, bool):
+        raise ApiError("invalid share recycle-bin state")
+    if not enabled:
+        return False, True
+    return enabled, admin_only
+
+
+def _listed_recycle_bin_options(api: ShareQuotaRawApi, name: str) -> tuple[bool, bool]:
+    response = api.list_folders(share_type="all", additional=["recyclebin"])
+    envelope = _as_mapping(response, "invalid share recycle-bin response")
+    if envelope.get("success") is not True:
+        raise ApiError("NAS API returned an unsuccessful share recycle-bin response")
+    data = _as_mapping(envelope.get("data"), "invalid share recycle-bin response data")
+    shares = _as_sequence(
+        data.get("shares"), "invalid share recycle-bin response shares"
+    )
+    for value in shares:
+        share = _as_mapping(value, "invalid share recycle-bin response share")
+        if share.get("name") != name:
+            continue
+        enabled = share.get("recyclebin")
+        if enabled is None:
+            return False, True
+        if not isinstance(enabled, bool):
+            raise ApiError("invalid share recycle-bin state")
+        if not enabled:
+            return False, True
+        admin_only = share.get("recycle_bin_admin_only")
+        if not isinstance(admin_only, bool):
+            raise ApiError("share recycle-bin admin-only state is unavailable")
+        return True, admin_only
+    raise ApiError("share was not found in recycle-bin response")
+
+
+def _read_quota_value(data: Mapping[str, object]) -> int:
+    value = data.get("quota_value", data.get("share_quota"))
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ApiError("invalid share quota state")
+    return value
+
+
+def _required_string(data: Mapping[str, object], field: str) -> str:
+    value = data.get(field)
+    if not isinstance(value, str):
+        raise ApiError(f"invalid share field: {field}")
+    return value
+
+
+def _required_boolean(data: Mapping[str, object], field: str) -> bool:
+    value = data.get(field)
+    if not isinstance(value, bool):
+        raise ApiError(f"invalid share field: {field}")
+    return value
+
+
+def _quota_set_payload(
+    state: MutableShareState, version: int, quota_api_value: int
+) -> ShareQuotaSetPayload:
+    shareinfo = {
+        "name": state.name,
+        "vol_path": state.volume_path,
+        "desc": state.description,
+        "hidden": state.hidden,
+        "enable_recycle_bin": state.recycle_bin_enabled,
+        "recycle_bin_admin_only": state.recycle_bin_admin_only,
+        "enable_share_compress": state.compression_enabled,
+        "enable_share_cow": state.cow_enabled,
+        "share_quota": quota_api_value,
+    }
+    return ShareQuotaSetPayload(
+        name=state.name,
+        version=version,
+        shareinfo=json.dumps(shareinfo, separators=(",", ":")),
+    )
+
+
+def _share_state_preserved(
+    current: MutableShareState, observed: MutableShareState
+) -> bool:
+    return (
+        current.name == observed.name
+        and current.volume_path == observed.volume_path
+        and current.description == observed.description
+        and current.hidden == observed.hidden
+        and current.recycle_bin_enabled == observed.recycle_bin_enabled
+        and current.recycle_bin_admin_only == observed.recycle_bin_admin_only
+        and current.compression_enabled == observed.compression_enabled
+        and current.cow_enabled == observed.cow_enabled
+    )
+
+
+def _quota_set_envelope(response: object) -> Mapping[str, object] | None:
+    try:
+        return _as_mapping(response, "invalid share quota set response")
+    except ApiError:
+        return None
+
+
+def _quota_failure_status(exc: Exception) -> OperationStatus:
+    if isinstance(
+        exc,
+        (
+            SynoConnectionError,
+            HTTPError,
+            JSONDecodeError,
+            RequestException,
+            OSError,
+        ),
+    ):
+        return OperationStatus.UNKNOWN
+    return OperationStatus.FAILED
 
 
 def _call_create_folder(
@@ -708,7 +1290,7 @@ def _normalize_nfs_rule(value: object) -> NfsClientPermission:
         async_enabled=async_enabled,
         insecure=insecure,
         crossmnt=crossmnt,
-        root_squash=root_squash,
+        root_squash="root",
         security_flavor=security_flavor,
     )
 
@@ -724,7 +1306,22 @@ def _nfs_rules_match(
     expected: tuple[NfsClientPermission, ...],
     actual: tuple[NfsClientPermission, ...],
 ) -> bool:
-    return set(expected) == set(actual)
+    return sorted(expected, key=_nfs_sort_key) == sorted(actual, key=_nfs_sort_key)
+
+
+def _nfs_sort_key(permission: NfsClientPermission) -> tuple[object, ...]:
+    return (
+        permission.client,
+        permission.access_mode.value,
+        permission.async_enabled,
+        permission.insecure,
+        permission.crossmnt,
+        permission.root_squash,
+        permission.security_flavor.sys,
+        permission.security_flavor.kerberos,
+        permission.security_flavor.kerberos_integrity,
+        permission.security_flavor.kerberos_privacy,
+    )
 
 
 def _nfs_precheck_result(result: ShareCreateResult) -> ShareCreateResult:
@@ -818,9 +1415,7 @@ PERMISSION_USER_GROUP_TYPES = (
     "ldap_user",
     "ldap_group",
 )
-
-# Missing explicitness metadata is excluded conservatively from ACL output.
-CUSTOM_ACL_POLICY = "require-is-custom-true"
+PERMISSION_PAGE_SIZE = 50
 
 
 def _permission_result(
@@ -913,6 +1508,80 @@ def _grouped_permission_payloads(
     return grouped
 
 
+def _permission_deltas(
+    current: tuple[AclPermissionState, ...],
+    desired: tuple[PermissionSpec, ...],
+    *,
+    clear_mode: bool = False,
+) -> dict[str, tuple[list[dict[str, object]], int, int]]:
+    current_by_identity: dict[tuple[str, str], AclPermissionState] = {}
+    for current_permission in current:
+        identity = (current_permission.category, current_permission.name)
+        if identity in current_by_identity:
+            raise ApiError("duplicate active permission response item")
+        current_by_identity[identity] = current_permission
+    desired_by_identity: dict[tuple[str, str], PermissionSpec] = {}
+    for permission in desired:
+        identity = (_permission_type(permission), permission.principal_name)
+        if identity in desired_by_identity:
+            raise ConfigurationError(
+                "duplicate permission specifications are not allowed"
+            )
+        desired_by_identity[identity] = permission
+    deltas: dict[str, tuple[list[dict[str, object]], int, int]] = {}
+    for category in PERMISSION_USER_GROUP_TYPES:
+        active_desired: list[dict[str, object]] = []
+        revocations: list[dict[str, object]] = []
+        category_desired = sorted(
+            (
+                permission
+                for (permission_category, _), permission in desired_by_identity.items()
+                if permission_category == category
+            ),
+            key=lambda permission: permission.principal_name,
+        )
+        for permission in category_desired:
+            existing_permission = current_by_identity.get(
+                (category, permission.principal_name)
+            )
+            if (
+                existing_permission is None
+                or existing_permission.access_mode is not permission.access_mode
+            ):
+                active_desired.append(_permission_payload(permission))
+        for (permission_category, principal_name), actual_permission in sorted(
+            current_by_identity.items(), key=lambda item: item[0]
+        ):
+            if (
+                permission_category == category
+                and (
+                    not actual_permission.is_admin
+                    or (clear_mode and actual_permission.category != "local_group")
+                )
+                and not (
+                    actual_permission.category == "local_group"
+                    and actual_permission.name == "administrators"
+                )
+                and (permission_category, principal_name) not in desired_by_identity
+            ):
+                revocations.append(_permission_revocation_payload(principal_name))
+        deltas[category] = (
+            [*active_desired, *revocations],
+            len(active_desired),
+            len(revocations),
+        )
+    return deltas
+
+
+def _permission_revocation_payload(name: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "is_deny": False,
+        "is_readonly": False,
+        "is_writable": False,
+    }
+
+
 def _apply_permissions(
     api: SharePermissionApi,
     name: str,
@@ -937,6 +1606,188 @@ def _apply_permissions(
             )
         )
     return tuple(steps)
+
+
+def _read_modify_permission_inventory(
+    api: SharePermissionApi, name: str
+) -> tuple[AclPermissionInventory, ...]:
+    inventory: list[AclPermissionInventory] = []
+    for category in PERMISSION_USER_GROUP_TYPES:
+        principals: list[AclPrincipal] = []
+        active_permissions: list[AclPermissionState] = []
+        seen_principals: set[AclPrincipal] = set()
+        for value in _read_permission_category(api, name, category):
+            principal, permission = _modify_permission_inventory_item(value, category)
+            if principal in seen_principals:
+                raise ApiError("duplicate permission inventory principal")
+            seen_principals.add(principal)
+            principals.append(principal)
+            if permission is not None:
+                active_permissions.append(permission)
+        inventory.append(
+            AclPermissionInventory(
+                category=category,
+                principals=tuple(principals),
+                active_permissions=tuple(active_permissions),
+            )
+        )
+    return tuple(inventory)
+
+
+def _active_modify_permissions(
+    inventory: tuple[AclPermissionInventory, ...],
+) -> tuple[AclPermissionState, ...]:
+    return tuple(
+        permission
+        for category_inventory in inventory
+        for permission in category_inventory.active_permissions
+    )
+
+
+def _validate_requested_principals(
+    inventory: tuple[AclPermissionInventory, ...],
+    requested: tuple[PermissionSpec, ...],
+) -> None:
+    existing = {
+        (principal.category, principal.name)
+        for category_inventory in inventory
+        for principal in category_inventory.principals
+    }
+    missing = tuple(
+        AclPrincipal(permission.principal_name, _permission_type(permission))
+        for permission in requested
+        if (_permission_type(permission), permission.principal_name) not in existing
+    )
+    if missing:
+        raise PrincipalNotFoundError(missing)
+
+
+def _read_permission_category(
+    api: SharePermissionApi, name: str, category: str
+) -> tuple[object, ...]:
+    offset = 0
+    entries: list[object] = []
+    while True:
+        response = api.get_folder_permissions(
+            name,
+            offset=offset,
+            limit=PERMISSION_PAGE_SIZE,
+            user_group_type=category,
+        )
+        envelope = _as_mapping(response, "invalid permission response envelope")
+        if envelope.get("success") is not True:
+            raise ApiError("NAS API returned an unsuccessful permission response")
+        data = _as_mapping(envelope.get("data"), "invalid permission response data")
+        total = data.get("total")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise ApiError("invalid permission response total")
+        page = _as_sequence(
+            data.get("permissions", data.get("items")),
+            "invalid permission response permissions",
+        )
+        if offset + len(page) > total:
+            raise ApiError("invalid permission response total")
+        entries.extend(page)
+        offset += len(page)
+        if offset == total:
+            return tuple(entries)
+        if not page:
+            raise ApiError("permission response pagination made no progress")
+
+
+def _modify_permission_inventory_item(
+    value: object, category: str
+) -> tuple[AclPrincipal, AclPermissionState | None]:
+    item = _as_mapping(value, "invalid permission response item")
+    name = item.get("name")
+    is_deny = item.get("is_deny")
+    is_readonly = item.get("is_readonly")
+    is_writable = item.get("is_writable")
+    is_custom = item.get("is_custom", False)
+    is_admin = item.get("is_admin", False)
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(is_deny, bool)
+        or not isinstance(is_readonly, bool)
+        or not isinstance(is_writable, bool)
+        or not isinstance(is_custom, bool)
+        or not isinstance(is_admin, bool)
+    ):
+        raise ApiError("invalid permission response item")
+    principal = AclPrincipal(name, category)
+    access_mode = _active_permission_access_mode(is_deny, is_readonly, is_writable)
+    if access_mode is None:
+        return principal, None
+    return principal, AclPermissionState(
+        name, category, access_mode, is_custom, is_admin
+    )
+
+
+def _active_permission_access_mode(
+    is_deny: bool, is_readonly: bool, is_writable: bool
+) -> PermissionAccessMode | None:
+    active_bits = sum((is_deny, is_readonly, is_writable))
+    if active_bits == 0:
+        return None
+    if active_bits != 1:
+        raise ApiError("ambiguous active permission response item")
+    if is_deny:
+        return PermissionAccessMode.DENY
+    if is_readonly:
+        return PermissionAccessMode.READ_ONLY
+    return PermissionAccessMode.READ_WRITE
+
+
+def _compare_modify_permissions(
+    actual: tuple[AclPermissionState, ...],
+    expected: tuple[PermissionSpec, ...],
+    *,
+    clear_mode: bool = False,
+) -> str | None:
+    expected_by_identity = {
+        (
+            _permission_type(permission),
+            permission.principal_name,
+        ): permission.access_mode
+        for permission in expected
+    }
+    actual_by_identity: dict[tuple[str, str], list[AclPermissionState]] = {}
+    for permission in actual:
+        actual_by_identity.setdefault(
+            (permission.category, permission.name), []
+        ).append(permission)
+    for identity, expected_access_mode in expected_by_identity.items():
+        actual_entries = actual_by_identity.get(identity, [])
+        if len(actual_entries) != 1:
+            return f"{identity[0]} expected entry is missing or duplicated"
+        if actual_entries[0].access_mode is not expected_access_mode:
+            return f"{identity[0]} expected entry has a different access mode"
+    for identity, actual_entries in actual_by_identity.items():
+        if identity in expected_by_identity:
+            continue
+        if clear_mode:
+            if any(
+                permission.category != "local_group"
+                or (permission.name != "administrators" and not permission.is_admin)
+                for permission in actual_entries
+            ):
+                return f"{identity[0]} has an uncleared active entry"
+        elif any(not permission.is_admin for permission in actual_entries):
+            return f"{identity[0]} has an unrequested active entry"
+    return None
+
+
+def _set_permissions(
+    api: SharePermissionApi,
+    name: str,
+    category: str,
+    permissions: list[dict[str, object]],
+) -> None:
+    response = api.set_folder_permissions(name, category, permissions)
+    envelope = _as_mapping(response, "invalid permission response envelope")
+    if envelope.get("success") is not True:
+        raise ApiError("NAS API returned an unsuccessful permission response")
 
 
 def _verify_permissions(
@@ -976,38 +1827,41 @@ def _normalize_acl_entries(
         data.get("permissions", data.get("items")),
         "invalid permission response permissions",
     )
-    entries: list[AclPermissionRecord] = []
-    for value in values:
-        item = _as_mapping(value, "invalid permission response item")
-        name = item.get("name")
-        is_deny = item.get("is_deny")
-        is_readonly = item.get("is_readonly")
-        is_writable = item.get("is_writable")
-        is_custom = item.get("is_custom", False)
-        is_admin = item.get("is_admin", False)
-        if (
-            not isinstance(name, str)
-            or not isinstance(is_deny, bool)
-            or not isinstance(is_readonly, bool)
-            or not isinstance(is_writable, bool)
-            or not isinstance(is_custom, bool)
-            or not isinstance(is_admin, bool)
-        ):
-            raise ApiError("invalid permission response item")
-        effective_admin = is_admin and (is_deny or is_readonly or is_writable)
-        if is_custom or effective_admin:
-            entries.append(
-                AclPermissionRecord(
-                    name,
-                    category,
-                    is_deny,
-                    is_readonly,
-                    is_writable,
-                    is_custom,
-                    is_admin,
-                )
-            )
-    return tuple(entries)
+    return tuple(
+        entry
+        for value in values
+        if (entry := _normalize_acl_entry(value, category)) is not None
+    )
+
+
+def _normalize_acl_entry(value: object, category: str) -> AclPermissionRecord | None:
+    item = _as_mapping(value, "invalid permission response item")
+    name = item.get("name")
+    is_deny = item.get("is_deny")
+    is_readonly = item.get("is_readonly")
+    is_writable = item.get("is_writable")
+    is_custom = item.get("is_custom", False)
+    is_admin = item.get("is_admin", False)
+    if (
+        not isinstance(name, str)
+        or not isinstance(is_deny, bool)
+        or not isinstance(is_readonly, bool)
+        or not isinstance(is_writable, bool)
+        or not isinstance(is_custom, bool)
+        or not isinstance(is_admin, bool)
+    ):
+        raise ApiError("invalid permission response item")
+    if _active_permission_access_mode(is_deny, is_readonly, is_writable) is None:
+        return None
+    return AclPermissionRecord(
+        name,
+        category,
+        is_deny,
+        is_readonly,
+        is_writable,
+        is_custom,
+        is_admin,
+    )
 
 
 def _permission_entries(response: object) -> set[tuple[str, bool, bool, bool]]:

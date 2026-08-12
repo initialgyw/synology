@@ -9,6 +9,7 @@ from synology.config import (
     validate_nfs_permission_specs,
     validate_permission_specs,
     validate_share_create_request,
+    validate_share_modify_request,
 )
 from synology.exceptions import ConfigurationError
 from synology.models import (
@@ -21,6 +22,7 @@ from synology.models import (
     RecycleBinOptions,
     ShareCreateOptions,
     ShareCreateRequest,
+    ShareModifyRequest,
 )
 
 
@@ -328,3 +330,27 @@ def test_recycle_bin_user_access_requires_recycle_bin() -> None:
                 ),
             )
         )
+
+
+def test_modify_request_preserves_zero_quota_and_trims_name() -> None:
+    request = validate_share_modify_request(
+        ShareModifyRequest(name=" media ", quota_gib=0)
+    )
+
+    assert request == ShareModifyRequest(name="media", quota_gib=0)
+
+
+@pytest.mark.parametrize(
+    "modify_request",
+    [
+        ShareModifyRequest(name="media"),
+        ShareModifyRequest(name="media", quota_gib=-1),
+        ShareModifyRequest(name="media", quota_gib=1, permissions=()),
+        ShareModifyRequest(name="media", permissions=(), nfs_permissions=()),
+    ],
+)
+def test_modify_request_requires_exactly_one_valid_family(
+    modify_request: ShareModifyRequest,
+) -> None:
+    with pytest.raises(ConfigurationError):
+        validate_share_modify_request(modify_request)

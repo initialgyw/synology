@@ -81,7 +81,7 @@ syn-cli list-shares --output yaml
 
 The table includes `NAME`, `VOLUME`, `DESCRIPTION`, `USB`, and `QUOTA_GIB`. UUID remains available in JSON and YAML.
 
-Use `--permissions` to enrich each share with explicitly configured custom ACL entries from all four categories and one per-share NFS privilege read. Inherited/default ACL entries are excluded; records without `is_custom: true` are conservatively excluded. This performs additional sequential read calls and never fetches or changes global NFS settings:
+Use `--permissions` to enrich each share with active ACL entries from all four categories and one per-share NFS privilege read. Entries with no active access bits are excluded; active entries are shown regardless of `is_custom`. This performs additional sequential read calls and never fetches or changes global NFS settings:
 
 ```bash
 syn-cli list-shares --permissions
@@ -368,6 +368,57 @@ and reads the rules back for verification. A post-create NFS failure or verifica
 mismatch returns exit code `60`, preserves the share, and performs no automatic rollback
 or retry.
 
+## Modify-share
+
+`modify-share` replaces exactly one setting family per invocation: quota, ACL, or NFS.
+It does not support append, remove, selectors, or merge modes.
+
+```bash
+syn-cli modify-share projects --permission 'local-user:alice:read-write'
+syn-cli modify-share projects --permission '' --yes
+syn-cli modify-share projects --nfs-permission 'client=10.192.10.0/24,access=read-write' --yes
+syn-cli modify-share projects --nfs-permission '' --yes
+syn-cli modify-share projects --quota 0
+```
+
+ACL replacement applies the supplied collection across all four mutable categories:
+local users, local groups, LDAP users, and LDAP groups. DSM treats permission updates
+as patches, so omitted active non-administrator principals are explicitly sent with
+no access bits to revoke them; empty lists are never used as a clearing signal. Protected
+administrator entries may remain when they are not requested. Before a confirmed ACL
+replacement writes anything, each requested principal must appear with the exact category and
+name in the complete DSM permission inventory; inactive inventory/default rows prove a
+principal exists but are ignored during reconciliation. This validation applies only to
+`modify-share`, not `create-share`.
+An explicit empty ACL value, `--permission ''`, revokes every currently active mutable
+permission, including local administrator users such as `synadmin`. Every local
+administrator group is preserved; in particular, `local_group:administrators` is never
+cleared. Omit `--permission` to leave ACL unselected. For each repeatable ACL option,
+exactly one empty value is valid; repeated empty values or an empty value mixed with a
+nonempty value are rejected.
+
+NFS replacement saves the complete supplied NFS rule list; `--nfs-permission ''` saves
+an empty list. Omit `--nfs-permission` to leave NFS unselected. For each repeatable NFS
+option, exactly one empty value is valid; repeated empty values or an empty value mixed
+with a nonempty value are rejected. Global NFS is not enabled, disabled, or otherwise
+changed by this command.
+
+`--quota` accepts a nonnegative integer in GiB. Positive values are converted to DSM's
+MiB API unit (`5 GiB` is sent as `5120 MiB`); `--quota 0` clears the limit and reports
+`unlimited`. A confirmed quota update reads the mutable share state, skips an exact
+quota no-op, sends a single complete share update that preserves known mutable fields,
+and reads it back to verify both the quota and preserved state. JSON and YAML include the
+observed API value and unit after a remote read; table output shows the observed value as
+GiB or `unlimited`.
+
+Without `--yes`, every modification is a local validated plan, requires no credentials,
+contacts no NAS, and exits `11`. ACL plans identify requested principal existence as
+unverified because they do not read DSM inventory. Confirmed ACL, NFS, and quota replacements skip writes
+for an exact no-op and verify changed state. A failed or uncertain write or post-write
+verification returns `60` with its completed and failed steps in the output. In particular,
+do not retry a quota request after a transport failure or malformed post-write response:
+the NAS may have accepted it, and the output marks the outcome as unknown.
+
 ## Exit codes and remediation
 
 | Code | Meaning |
@@ -375,12 +426,13 @@ or retry.
 | `0` | Success |
 | `2` | Command-line syntax or usage error |
 | `10` | Configuration or validation failure |
-| `11` | Validated local create or delete plan; no mutation performed |
+| `11` | Validated local create, delete, or modify plan; no mutation performed |
 | `20` | Authentication or authorization failure |
 | `30` | Transport, TLS, or network failure |
 | `40` | Synology API or malformed-response failure |
+| `41` | Requested `modify-share` ACL principal was not found in DSM inventory |
 | `50` | Output or serialization failure |
-| `60` | Partial or uncertain post-create operation outcome |
+| `60` | Partial or uncertain mutation outcome |
 | `70` | Unexpected internal failure |
 
 Capture an exit code in shell scripts:

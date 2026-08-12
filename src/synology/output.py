@@ -9,9 +9,12 @@ from synology.models import (
     EnrichmentStatus,
     NfsClientPermission,
     OutputFormat,
+    PermissionSpec,
     ShareCreateResult,
     ShareDeleteResult,
     ShareDetails,
+    ShareModifyResult,
+    ShareOperationStep,
     ShareRecord,
 )
 
@@ -162,6 +165,114 @@ def render_share_delete(result: ShareDeleteResult, output_format: OutputFormat) 
         return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
     except (TypeError, ValueError, yaml.YAMLError) as exc:
         raise OutputError("unable to render output") from exc
+
+
+def render_share_modify(result: ShareModifyResult, output_format: OutputFormat) -> str:
+    try:
+        record: dict[str, object] = {
+            "name": result.name,
+            "changed": result.changed,
+            "steps": [_step_record(step) for step in result.steps],
+        }
+        if result.quota_gib is not None:
+            record["quota_gib"] = result.quota_gib
+        if result.observed_quota is not None:
+            record["observed_quota"] = {
+                "api_value": result.observed_quota.api_value,
+                "api_unit": result.observed_quota.api_unit,
+                "unlimited": result.observed_quota.unlimited,
+                "gib": result.observed_quota.gib,
+            }
+        if result.permissions is not None:
+            record["permissions"] = _modify_permissions(result.permissions)
+        if result.nfs_permissions is not None:
+            record["nfs_permissions"] = [
+                _nfs_record(item) for item in result.nfs_permissions
+            ]
+        if output_format is OutputFormat.TABLE:
+            family, rules = _modify_summary(result)
+            status = (
+                "changed"
+                if result.changed
+                else "planned"
+                if any(step.status.value == "planned" for step in result.steps)
+                else "no-op"
+            )
+            headers = ["NAME", "FAMILY", "REPLACEMENT", "STATUS"]
+            values = [result.name, family, rules, status]
+            widths = [
+                max(len(header), len(value))
+                for header, value in zip(headers, values, strict=True)
+            ]
+            return "\n".join(
+                [
+                    "  ".join(
+                        header.ljust(width)
+                        for header, width in zip(headers, widths, strict=True)
+                    ),
+                    "  ".join("-" * width for width in widths),
+                    "  ".join(
+                        value.ljust(width)
+                        for value, width in zip(values, widths, strict=True)
+                    ),
+                ]
+            )
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
+
+
+def _modify_permissions(
+    permissions: tuple[PermissionSpec, ...],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "principal_type": item.principal_type.value,
+            "principal_name": item.principal_name,
+            "access_mode": item.access_mode.value,
+        }
+        for item in permissions
+    ]
+
+
+def _step_record(step: ShareOperationStep) -> dict[str, str]:
+    return {
+        "name": step.name,
+        "status": step.status.value,
+        **({"message": step.message} if step.message is not None else {}),
+        **(
+            {"permission_status": step.permission_status.value}
+            if step.permission_status is not None
+            else {}
+        ),
+    }
+
+
+def _modify_summary(result: ShareModifyResult) -> tuple[str, str]:
+    if result.quota_gib is not None:
+        if result.observed_quota is not None:
+            return (
+                "quota",
+                "unlimited"
+                if result.observed_quota.unlimited
+                else f"{result.observed_quota.gib:g} GiB",
+            )
+        return (
+            "quota",
+            "unlimited" if result.quota_gib == 0 else f"{result.quota_gib} GiB",
+        )
+    if result.permissions is not None:
+        return "acl", "; ".join(
+            f"{item.principal_type.value}:{item.principal_name}:{item.access_mode.value}"
+            for item in result.permissions
+        ) or "clear"
+    if result.nfs_permissions is not None:
+        return "nfs", "; ".join(
+            f"{item.client}:{item.access_mode.value}" for item in result.nfs_permissions
+        ) or "clear"
+    return "-", "-"
 
 
 def _permission_records(result: ShareCreateResult) -> list[dict[str, str]]:

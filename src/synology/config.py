@@ -17,6 +17,7 @@ from synology.models import (
     ShareCreateOptions,
     ShareCreateRequest,
     ShareDeleteRequest,
+    ShareModifyRequest,
 )
 
 QUOTA_MIB_PER_GIB = 1024
@@ -126,6 +127,36 @@ def validate_permission_specs(
             "conflicting permission specifications are not allowed"
         )
     return permissions
+
+
+def validate_share_modify_request(request: ShareModifyRequest) -> ShareModifyRequest:
+    name = request.name.strip()
+    if not name:
+        raise ConfigurationError("share name must not be empty")
+    if name in {".", ".."} or any(character in {"/", "\\"} for character in name):
+        raise ConfigurationError("share name contains invalid characters")
+    if _contains_control_characters(name):
+        raise ConfigurationError("share name contains invalid characters")
+    families = sum(
+        item is not None
+        for item in (
+            request.quota_gib,
+            request.permissions,
+            request.nfs_permissions,
+        )
+    )
+    if families != 1:
+        raise ConfigurationError(
+            "exactly one of quota, permissions, or NFS permissions must be selected"
+        )
+    if request.quota_gib is not None:
+        if isinstance(request.quota_gib, bool) or not isinstance(
+            request.quota_gib, int
+        ):
+            raise ConfigurationError("quota must be an integer GiB value")
+        if request.quota_gib < 0 or request.quota_gib > MAX_QUOTA_GIB:
+            raise ConfigurationError(f"quota must be between 0 and {MAX_QUOTA_GIB} GiB")
+    return replace(request, name=name)
 
 
 def validate_share_delete_request(request: ShareDeleteRequest) -> ShareDeleteRequest:

@@ -10,6 +10,7 @@ from synology.config import (
     validate_permission_specs,
     validate_share_create_request,
     validate_share_delete_request,
+    validate_share_modify_request,
 )
 from synology.exceptions import (
     ApiError,
@@ -17,6 +18,7 @@ from synology.exceptions import (
     ConfigurationError,
     OutputError,
     PartialOperationError,
+    PrincipalNotFoundError,
     TransportError,
     UnexpectedApplicationError,
 )
@@ -25,8 +27,10 @@ from synology.models import (
     CliArguments,
     Command,
     ConnectionConfig,
+    NfsClientPermission,
     OperationStatus,
     OutputFormat,
+    PermissionSpec,
     RecycleBinOptions,
     ShareCreateOptions,
     ShareCreateRequest,
@@ -34,6 +38,8 @@ from synology.models import (
     ShareDeleteRequest,
     ShareDeleteResult,
     ShareDetails,
+    ShareModifyRequest,
+    ShareModifyResult,
     ShareOperationStep,
     ShareRecord,
 )
@@ -41,6 +47,7 @@ from synology.output import (
     render_share_create,
     render_share_delete,
     render_share_details,
+    render_share_modify,
     render_shares,
 )
 from synology.shares import SynShareClient
@@ -54,6 +61,8 @@ class ShareClient(Protocol):
     def create_share(self, request: ShareCreateRequest) -> ShareCreateResult: ...
 
     def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult: ...
+
+    def modify_share(self, request: ShareModifyRequest) -> ShareModifyResult: ...
 
 
 class ShareClientFactory(Protocol):
@@ -118,6 +127,50 @@ def run(
                     stdout,
                 )
                 return 11
+        if arguments.command is Command.MODIFY_SHARE:
+            if len(arguments.quota_values) > 1:
+                raise ConfigurationError("--quota may be specified only once")
+            permissions, acl_clear_mode = _modify_permissions(
+                arguments.permission_specs
+            )
+            nfs_permissions = _modify_nfs_permissions(arguments.nfs_permission_specs)
+            modify_request = validate_share_modify_request(
+                ShareModifyRequest(
+                    name=arguments.name,
+                    quota_gib=(
+                        arguments.quota_values[0] if arguments.quota_values else None
+                    ),
+                    permissions=permissions,
+                    nfs_permissions=nfs_permissions,
+                    _acl_clear_mode=acl_clear_mode,
+                )
+            )
+            if not arguments.confirm:
+                _write_output(
+                    render_share_modify(
+                        ShareModifyResult(
+                            name=modify_request.name,
+                            changed=False,
+                            quota_gib=modify_request.quota_gib,
+                            permissions=modify_request.permissions,
+                            nfs_permissions=modify_request.nfs_permissions,
+                            steps=(
+                                ShareOperationStep(
+                                    name="modify",
+                                    status=OperationStatus.PLANNED,
+                                    message=(
+                                        "principal existence unverified"
+                                        if modify_request.permissions
+                                        else None
+                                    ),
+                                ),
+                            ),
+                        ),
+                        arguments.output,
+                    ),
+                    stdout,
+                )
+                return 11
         if arguments.command is Command.CREATE_SHARE:
             if arguments.disable_recycle_bin and arguments.recycle_bin_user_access:
                 raise ConfigurationError(
@@ -129,7 +182,7 @@ def run(
             nfs_permissions = validate_nfs_permission_specs(
                 arguments.nfs_permission_specs
             )
-            request = validate_share_create_request(
+            create_request = validate_share_create_request(
                 ShareCreateRequest(
                     name=arguments.name,
                     volume_path=arguments.volume_path,
@@ -150,11 +203,11 @@ def run(
                 _write_output(
                     render_share_create(
                         ShareCreateResult(
-                            name=request.name,
-                            volume=request.volume_path,
-                            description=request.description,
+                            name=create_request.name,
+                            volume=create_request.volume_path,
+                            description=create_request.description,
                             created=False,
-                            options=request.options,
+                            options=create_request.options,
                             permissions=permissions,
                             nfs_permissions=nfs_permissions,
                             steps=(
@@ -173,9 +226,13 @@ def run(
         if config.insecure:
             logger.warning("TLS certificate verification is disabled")
         client = factory(config, logger)
-        if arguments.command is Command.CREATE_SHARE:
+        if arguments.command is Command.MODIFY_SHARE:
+            rendered = render_share_modify(
+                client.modify_share(modify_request), arguments.output
+            )
+        elif arguments.command is Command.CREATE_SHARE:
             rendered = render_share_create(
-                client.create_share(request), arguments.output
+                client.create_share(create_request), arguments.output
             )
         elif arguments.command is Command.DELETE_SHARE:
             rendered = render_share_delete(
@@ -207,13 +264,22 @@ def run(
     except TransportError as exc:
         _write_error(str(exc), stderr)
         return 30
+    except PrincipalNotFoundError as exc:
+        _write_error(str(exc), stderr)
+        return 41
     except ApiError as exc:
         _write_error(str(exc), stderr)
         return 40
     except PartialOperationError as exc:
-        result = cast(ShareCreateResult, exc.result)
+        result = exc.result
         try:
-            _write_output(render_share_create(result, arguments.output), stdout)
+            if isinstance(result, ShareModifyResult):
+                rendered = render_share_modify(result, arguments.output)
+            elif isinstance(result, ShareCreateResult):
+                rendered = render_share_create(result, arguments.output)
+            else:
+                raise OutputError("unable to render partial operation output")
+            _write_output(rendered, stdout)
         except OutputError as output_exc:
             _write_error(str(output_exc), stderr)
             return 50
@@ -249,16 +315,15 @@ def _build_parser() -> _CliArgumentParser:
             "Examples:\n"
             "  syn-cli list-shares --output json\n"
             "  syn-cli create-share projects --path /volume1\n"
-             "  syn-cli create-share projects --path /volume1 --yes\n"
-             "  syn-cli delete-share projects --yes\n"
-
+            "  syn-cli create-share projects --path /volume1 --yes\n"
+            "  syn-cli delete-share projects --yes\n"
             "  syn-cli create-share projects --path /volume1 "
             "--permission 'local-user:alice:read-write' --yes\n"
             "  syn-cli create-share nfs-data --path /volume1 "
-            "--nfs-permission 'client=10.192.10.0/24,access=read-write' --yes\n\n"
-             "Create and delete operations require --yes to contact the NAS; "
-             "without it, a local plan is printed and exit code 11 is returned."
-
+            "--nfs-permission 'client=10.192.10.0/24,access=read-write' --yes\n"
+            "  syn-cli modify-share projects --permission ''\n\n"
+            "Create, delete, and modify operations require --yes to contact the NAS; "
+            "without it, a local plan is printed and exit code 11 is returned."
         ),
     )
     _add_global_options(parser)
@@ -377,6 +442,53 @@ def _build_parser() -> _CliArgumentParser:
         default=OutputFormat.TABLE.value,
         help="Output format: table, json, or yaml. Defaults to table.",
     )
+    modify_share = subparsers.add_parser(
+        "modify-share",
+        help="Replace share quota, ACL, or NFS rules.",
+        description=(
+            "Replace exactly one share setting family. Without --yes, validate and "
+            "print a local plan without contacting the NAS."
+        ),
+    )
+    _add_global_options(modify_share)
+    modify_share.add_argument("name", help="Shared-folder name to modify.")
+    modify_share.add_argument(
+        "--quota",
+        dest="quota_values",
+        action="append",
+        type=int,
+        metavar="INTEGER",
+        help="Quota in GiB; zero clears the quota (unlimited).",
+    )
+    modify_share.add_argument(
+        "--permission",
+        dest="permission_specs",
+        action="append",
+        default=[],
+        metavar="TYPE:NAME:ACCESS",
+        help="Repeatable replacement ACL rule; an empty value clears the ACL.",
+    )
+    modify_share.add_argument(
+        "--nfs-permission",
+        dest="nfs_permission_specs",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="Repeatable replacement NFS rule; an empty value clears all NFS rules.",
+    )
+    modify_share.add_argument(
+        "--yes",
+        dest="confirm",
+        action="store_true",
+        help="Confirm NAS mutation; without it, print a local plan and exit 11.",
+    )
+    modify_share.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
     delete_share = subparsers.add_parser(
         "delete-share",
         help="Delete a shared folder.",
@@ -470,6 +582,7 @@ def _parse_arguments(
             ),
             compress=_boolean(values.get("compress", False), "compress"),
             quota_gib=_optional_integer(values.get("quota_gib"), "quota"),
+            quota_values=_integer_tuple(values.get("quota_values", []), "quota"),
             permission_specs=_string_tuple(
                 values.get("permission_specs", []), "permission"
             ),
@@ -480,6 +593,35 @@ def _parse_arguments(
         )
     except ValueError as exc:
         raise _UsageError("invalid command-line value") from exc
+
+
+def _modify_permissions(
+    specifications: tuple[str, ...],
+) -> tuple[tuple[PermissionSpec, ...] | None, bool]:
+    if not specifications:
+        return None, False
+    if "" in specifications:
+        if len(specifications) != 1:
+            raise ConfigurationError(
+                "--permission may contain exactly one empty value and no other values"
+            )
+        return (), True
+    return validate_permission_specs(specifications), False
+
+
+def _modify_nfs_permissions(
+    specifications: tuple[str, ...],
+) -> tuple[NfsClientPermission, ...] | None:
+    if not specifications:
+        return None
+    if "" in specifications:
+        if len(specifications) != 1:
+            raise ConfigurationError(
+                "--nfs-permission may contain exactly one empty value "
+                "and no other values"
+            )
+        return ()
+    return validate_nfs_permission_specs(specifications)
 
 
 def _optional_string(value: object, name: str) -> str | None:
@@ -517,6 +659,16 @@ def _optional_integer(value: object, name: str) -> int | None:
         return None
     if isinstance(value, int) and not isinstance(value, bool):
         return value
+    raise _UsageError(f"invalid {name}")
+
+
+def _integer_tuple(value: object, name: str) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list) and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in value
+    ):
+        return tuple(value)
     raise _UsageError(f"invalid {name}")
 
 
