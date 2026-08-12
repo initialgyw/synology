@@ -1,0 +1,57 @@
+name: Tag release
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read project version
+        id: version
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid project version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create or verify tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          tag="v${VERSION}"
+          commit="$(git rev-parse HEAD)"
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" | awk '{print $1}')"
+          if [[ -n "$existing" ]]; then
+            if [[ "$existing" == "$commit" ]]; then
+              echo "${tag} already points to ${commit}"
+              exit 0
+            fi
+            echo "Tag ${tag} already exists at ${existing}; refusing to move it" >&2
+            exit 1
+          fi
+          git tag "$tag" "$commit"
+          git push origin "$tag"
