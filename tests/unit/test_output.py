@@ -3,11 +3,15 @@ import json
 import pytest
 import yaml
 
+from synology.apply_config import ApplyConfig, ApplyOperation, ApplyPlan, ApplyShare
 from synology.models import (
     AclPermissionRecord,
     EnrichmentStatus,
     NfsAccessMode,
     NfsClientPermission,
+    NfsDisplayPermission,
+    NfsRootSquash,
+    NfsSecurityFlavor,
     OperationStatus,
     OutputFormat,
     RecycleBinOptions,
@@ -17,7 +21,39 @@ from synology.models import (
     ShareOperationStep,
     ShareRecord,
 )
-from synology.output import render_share_create, render_share_details, render_shares
+from synology.output import (
+    apply_plan_warnings,
+    render_share_create,
+    render_share_details,
+    render_shares,
+)
+
+
+def test_apply_plan_warnings_use_desired_nfs_models_not_operation_text() -> None:
+    guest_rule = NfsClientPermission(
+        "10.192.10.0/24", NfsAccessMode.READ_WRITE, root_squash=NfsRootSquash.GUEST
+    )
+    admin_rule = NfsClientPermission(
+        "10.192.10.1", NfsAccessMode.READ_WRITE, root_squash=NfsRootSquash.ADMIN
+    )
+    plan = ApplyPlan(
+        ApplyConfig(
+            host=None,
+            principal_lookup_share=None,
+            shares=(
+                ApplyShare("projects", "/volume1", "present", "", 0, (), (guest_rule,)),
+                ApplyShare(
+                    "unmanaged", "/volume1", "present", "", 0, (), (admin_rule,)
+                ),
+            ),
+        ),
+        (ApplyOperation("projects", "nfs", "before", "formatted differently"),),
+    )
+
+    assert apply_plan_warnings(plan) == [
+        "root_squash=guest (Map root to guest) changes root-originated identity "
+        "mapping; review before applying"
+    ]
 
 
 def test_table_uses_approved_identity_columns() -> None:
@@ -97,6 +133,292 @@ def test_detail_table_renders_multiline_custom_permissions_and_nfs() -> None:
     assert "local_group:developers:read-only" in rendered
     assert "10.192.10.0/24:read-write" in rendered
     assert rendered.count("projects") == 1
+
+
+def test_detail_json_includes_complete_nfs_security_flavor() -> None:
+    details = (
+        ShareDetails(
+            share=ShareRecord(name="projects", volume="/volume1"),
+            nfs_permissions=(
+                NfsClientPermission(
+                    client="10.192.10.0/24",
+                    access_mode=NfsAccessMode.READ_WRITE,
+                    security_flavor=NfsSecurityFlavor(
+                        sys=False,
+                        kerberos=True,
+                        kerberos_integrity=True,
+                        kerberos_privacy=False,
+                    ),
+                ),
+            ),
+            nfs_status=EnrichmentStatus.AVAILABLE,
+        ),
+    )
+    rendered = json.loads(render_share_details(details, OutputFormat.JSON))
+    assert rendered[0]["nfs_permissions"][0]["security_flavor"] == {
+        "sys": False,
+        "kerberos": True,
+        "kerberos_integrity": True,
+        "kerberos_privacy": False,
+    }
+
+
+def test_detail_table_renders_enabled_security_flavors_or_empty_list() -> None:
+    detail = ShareDetails(
+        share=ShareRecord(name="projects"),
+        nfs_permissions=(
+            NfsClientPermission(
+                "10.192.10.1",
+                NfsAccessMode.READ_WRITE,
+                security_flavor=NfsSecurityFlavor(
+                    sys=True,
+                    kerberos=True,
+                    kerberos_integrity=True,
+                    kerberos_privacy=True,
+                ),
+            ),
+            NfsClientPermission(
+                "10.192.10.2",
+                NfsAccessMode.READ_WRITE,
+                security_flavor=NfsSecurityFlavor(
+                    sys=False,
+                    kerberos=False,
+                    kerberos_integrity=False,
+                    kerberos_privacy=False,
+                ),
+            ),
+        ),
+        nfs_status=EnrichmentStatus.AVAILABLE,
+    )
+
+    rendered = render_share_details((detail,), OutputFormat.TABLE)
+
+    assert (
+        "security_flavors=[sys,kerberos,kerberos_integrity,kerberos_privacy]"
+        in rendered
+    )
+    assert "security_flavors=[]" in rendered
+
+
+def test_detail_output_preserves_malformed_nfs_clients_without_internal_field() -> None:
+    details = (
+        ShareDetails(
+            share=ShareRecord(name="projects", volume="/volume1"),
+            nfs_permissions=(
+                NfsClientPermission("10.192.10.0/24", NfsAccessMode.READ_ONLY),
+            ),
+            nfs_display_permissions=(
+                NfsClientPermission("10.192.10.0/24", NfsAccessMode.READ_ONLY),
+                NfsDisplayPermission("10.192.10.0/2", NfsAccessMode.READ_WRITE),
+            ),
+            nfs_status=EnrichmentStatus.AVAILABLE,
+        ),
+    )
+
+    table = render_share_details(details, OutputFormat.TABLE)
+    structured = json.loads(render_share_details(details, OutputFormat.JSON))
+
+    assert "10.192.10.0/24:read-only" in table
+    assert "10.192.10.0/2:read-write" in table
+    assert "INVALID CIDR" not in table
+    assert structured[0]["nfs_permissions"] == [
+        {
+            "client": "10.192.10.0/2",
+            "access": "read-write",
+            "async": False,
+            "insecure": False,
+            "crossmnt": False,
+            "root_squash": "root",
+            "security_flavor": {
+                "sys": True,
+                "kerberos": False,
+                "kerberos_integrity": False,
+                "kerberos_privacy": False,
+            },
+        },
+        {
+            "client": "10.192.10.0/24",
+            "access": "read-only",
+            "async": False,
+            "insecure": False,
+            "crossmnt": False,
+            "root_squash": "root",
+            "security_flavor": {
+                "sys": True,
+                "kerberos": False,
+                "kerberos_integrity": False,
+                "kerberos_privacy": False,
+            },
+        },
+    ]
+    assert "nfs_rule_observations" not in structured[0]
+
+
+def test_detail_output_hides_only_protected_administrator_acl() -> None:
+    protected = AclPermissionRecord(
+        "administrators", "local_group", False, False, True, False, True
+    )
+    visible = AclPermissionRecord(
+        "developers", "local_group", False, True, False, True, False
+    )
+    administrator_read_only = AclPermissionRecord(
+        "administrators", "local_group", False, True, False, True, False
+    )
+    administrator_deny = AclPermissionRecord(
+        "administrators", "local_group", True, False, False, True, False
+    )
+    protected_only = ShareDetails(
+        share=ShareRecord(name="protected-only"),
+        acl_permissions=(protected,),
+        acl_status=EnrichmentStatus.AVAILABLE,
+    )
+    mixed = ShareDetails(
+        share=ShareRecord(name="mixed"),
+        acl_permissions=(
+            visible,
+            protected,
+            administrator_read_only,
+            administrator_deny,
+        ),
+        acl_status=EnrichmentStatus.AVAILABLE,
+    )
+
+    table = render_share_details((protected_only, mixed), OutputFormat.TABLE)
+    json_value = json.loads(
+        render_share_details((protected_only, mixed), OutputFormat.JSON)
+    )
+    yaml_value = yaml.safe_load(
+        render_share_details((protected_only, mixed), OutputFormat.YAML)
+    )
+
+    protected_row = next(
+        line for line in table.splitlines() if "protected-only" in line
+    )
+    assert protected_row.split() == ["protected-only", "-", "-", "-", "-", "-", "-"]
+    assert "developers:read-only" in table
+    assert "administrators:read-only" in table
+    assert "administrators:deny" in table
+    assert "administrators:read-write" not in table
+    assert json_value[0]["permissions"] == []
+    assert [
+        (item["name"], item["is_deny"], item["is_readonly"], item["is_writable"])
+        for item in json_value[1]["permissions"]
+    ] == [
+        ("administrators", True, False, False),
+        ("administrators", False, True, False),
+        ("developers", False, True, False),
+    ]
+    assert yaml_value == json_value
+
+
+def test_detail_table_displays_complete_nfs_rules_in_deterministic_order() -> None:
+    permissions = tuple(
+        NfsClientPermission(
+            client=f"10.192.10.{5 - index}",
+            access_mode=NfsAccessMode.READ_WRITE,
+            async_enabled=index % 2 == 0,
+            insecure=index % 2 == 1,
+            crossmnt=index % 2 == 0,
+            root_squash=root_squash,
+        )
+        for index, root_squash in enumerate(NfsRootSquash)
+    )
+    detail = ShareDetails(
+        share=ShareRecord(name="projects"),
+        nfs_permissions=permissions,
+        nfs_status=EnrichmentStatus.AVAILABLE,
+    )
+
+    table = render_share_details((detail,), OutputFormat.TABLE)
+    structured = json.loads(render_share_details((detail,), OutputFormat.JSON))
+
+    assert (
+        "squash=root,security_flavors=[sys],async=true,insecure=false,crossmnt=true"
+        in table
+    )
+    assert (
+        "squash=admin,security_flavors=[sys],async=false,insecure=true,crossmnt=false"
+        in table
+    )
+    assert "squash=guest" in table
+    assert "squash=all_admin" in table
+    assert "squash=all_guest" in table
+    assert [item["client"] for item in structured[0]["nfs_permissions"]] == sorted(
+        item.client for item in permissions
+    )
+    assert all(
+        item["security_flavor"]
+        == {
+            "sys": True,
+            "kerberos": False,
+            "kerberos_integrity": False,
+            "kerberos_privacy": False,
+        }
+        for item in structured[0]["nfs_permissions"]
+    )
+    assert "nfs_rule_observations" not in structured[0]
+
+
+def test_detail_nfs_sorting_is_identity_first_then_full_rule() -> None:
+    detail = ShareDetails(
+        share=ShareRecord(name="projects"),
+        nfs_permissions=(
+            NfsClientPermission(
+                "10.192.10.10",
+                NfsAccessMode.READ_WRITE,
+                async_enabled=True,
+                root_squash=NfsRootSquash.GUEST,
+            ),
+            NfsClientPermission(
+                "10.192.10.10",
+                NfsAccessMode.READ_WRITE,
+                async_enabled=False,
+                root_squash=NfsRootSquash.GUEST,
+            ),
+            NfsClientPermission(
+                "10.192.10.10",
+                NfsAccessMode.READ_WRITE,
+                root_squash=NfsRootSquash.ADMIN,
+            ),
+        ),
+        nfs_status=EnrichmentStatus.AVAILABLE,
+    )
+
+    rendered = json.loads(render_share_details((detail,), OutputFormat.JSON))
+
+    assert [item["root_squash"] for item in rendered[0]["nfs_permissions"]] == [
+        "admin",
+        "guest",
+        "guest",
+    ]
+    assert [item["async"] for item in rendered[0]["nfs_permissions"]] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_detail_output_distinguishes_unavailable_nfs_from_known_empty() -> None:
+    unavailable = ShareDetails(
+        share=ShareRecord(name="unavailable"),
+        nfs_status=EnrichmentStatus.UNAVAILABLE,
+    )
+    empty = ShareDetails(
+        share=ShareRecord(name="empty"),
+        nfs_status=EnrichmentStatus.EMPTY,
+    )
+
+    table = render_share_details((unavailable, empty), OutputFormat.TABLE)
+    json_value = json.loads(
+        render_share_details((unavailable, empty), OutputFormat.JSON)
+    )
+    yaml_value = yaml.safe_load(
+        render_share_details((unavailable, empty), OutputFormat.YAML)
+    )
+
+    assert "?" in table
+    assert [item["nfs_permissions"] for item in json_value] == [None, []]
+    assert yaml_value == json_value
 
 
 def test_detail_table_renders_effective_admin_permission() -> None:

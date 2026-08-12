@@ -2,6 +2,7 @@ import json
 from io import StringIO
 
 import pytest
+import yaml
 from requests.exceptions import SSLError
 from synology_api.exceptions import CoreError, LoginError
 
@@ -10,6 +11,7 @@ from synology.exceptions import (
     AuthenticationError,
     ConfigurationError,
     PartialOperationError,
+    PrincipalNotFoundError,
     TransportError,
 )
 from synology.logging import configure_logging
@@ -17,7 +19,11 @@ from synology.models import (
     ConnectionConfig,
     NfsAccessMode,
     NfsClientPermission,
+    NfsDisplayPermission,
+    NfsRootSquash,
+    NfsSecurityFlavor,
     OperationStatus,
+    OutputFormat,
     PermissionAccessMode,
     PermissionPrincipalType,
     PermissionSpec,
@@ -27,7 +33,13 @@ from synology.models import (
     ShareDeleteRequest,
     ShareOperationStep,
 )
-from synology.shares import SynShareClient, _SharePermissionAdapter
+from synology.output import render_share_details
+from synology.shares import (
+    SynShareClient,
+    _nfs_rule,
+    _normalize_nfs_rule,
+    _SharePermissionAdapter,
+)
 
 
 class FakeShare:
@@ -232,7 +244,7 @@ def _nfs_load_response(permission: NfsClientPermission) -> dict[str, object]:
                     "privilege": "rw"
                     if permission.access_mode is NfsAccessMode.READ_WRITE
                     else "ro",
-                    "root_squash": permission.root_squash,
+                    "root_squash": permission.root_squash.value,
                     "security_flavor": {
                         "sys": permission.security_flavor.sys,
                         "kerberos": permission.security_flavor.kerberos,
@@ -709,6 +721,72 @@ def test_create_share_applies_and_verifies_nfs_rules() -> None:
     assert nfs_api.calls[2][2]["method"] == "load"
 
 
+@pytest.mark.parametrize("root_squash", list(NfsRootSquash))
+def test_nfs_root_squash_values_serialize_and_normalize_exactly(
+    root_squash: NfsRootSquash,
+) -> None:
+    assert (
+        NfsClientPermission("10.192.10.20", NfsAccessMode.READ_WRITE).root_squash
+        is NfsRootSquash.ROOT
+    )
+    permission = NfsClientPermission(
+        client="10.192.10.20",
+        access_mode=NfsAccessMode.READ_WRITE,
+        root_squash=root_squash,
+    )
+
+    assert _nfs_rule(permission)["root_squash"] == root_squash.value
+    assert (
+        _normalize_nfs_rule(_nfs_load_response(permission)["data"]["rule"][0])
+        == permission
+    )
+
+
+@pytest.mark.parametrize("root_squash", list(NfsRootSquash))
+def test_nfs_save_payload_uses_exact_root_squash_token(
+    root_squash: NfsRootSquash,
+) -> None:
+    permission = NfsClientPermission(
+        client="10.192.10.20",
+        access_mode=NfsAccessMode.READ_WRITE,
+        root_squash=root_squash,
+    )
+    nfs_api = FakeNfsApi(
+        {"success": True, "data": {"enable_nfs": True}},
+        {"success": True},
+        _nfs_load_response(permission),
+    )
+    share = FakeShare(create_response={"success": True, "data": {"name": "projects"}})
+    client = SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(share),
+        nfs_factory=lambda _: nfs_api,
+    )
+
+    client.create_share(
+        ShareCreateRequest(
+            name="projects", volume_path="/volume1", nfs_permissions=(permission,)
+        )
+    )
+
+    assert (
+        json.loads(str(nfs_api.calls[1][2]["rule"]))[0]["root_squash"]
+        == root_squash.value
+    )
+
+
+@pytest.mark.parametrize("root_squash", ["no_root_squash", "none", "unknown", None])
+def test_nfs_normalization_rejects_unknown_root_squash(root_squash: object) -> None:
+    rule = _nfs_load_response(
+        NfsClientPermission("10.192.10.20", NfsAccessMode.READ_WRITE)
+    )["data"]["rule"][0]
+    rule["root_squash"] = root_squash
+
+    with pytest.raises(ApiError, match="invalid NFS rule"):
+        _normalize_nfs_rule(rule)
+
+
 def test_disabled_global_nfs_prevents_share_creation() -> None:
     nfs_permission = NfsClientPermission(
         client="10.192.10.20",
@@ -959,6 +1037,138 @@ def test_acl_normalization_renders_active_noncustom_ldap_and_excludes_inventory(
     assert details[0].acl_permissions[0].is_custom is False
 
 
+def test_list_details_preserves_malformed_live_nfs_client_for_display() -> None:
+    share = FakeShare(
+        response={
+            "success": True,
+            "data": {"shares": [{"name": "projects"}], "total": 1},
+        }
+    )
+    raw_rule = {
+        "async": True,
+        "client": "10.192.10.0/2",
+        "crossmnt": True,
+        "insecure": True,
+        "privilege": "rw",
+        "root_squash": "all_admin",
+        "security_flavor": {
+            "sys": True,
+            "kerberos": False,
+            "kerberos_integrity": False,
+            "kerberos_privacy": False,
+        },
+    }
+    client = SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(share),
+        permission_factory=lambda _: FakePermissionApi(
+            {
+                category: _permission_response([])
+                for category in (
+                    "local_user",
+                    "local_group",
+                    "ldap_user",
+                    "ldap_group",
+                )
+            }
+        ),
+        nfs_factory=lambda _: FakeNfsApi(
+            {"success": True, "data": {"enable_nfs": True}},
+            {"success": True},
+            {"success": True, "data": {"rule": [raw_rule]}},
+        ),
+    )
+
+    detail = client.list_share_details()[0]
+
+    assert detail.nfs_status.value == "available"
+    assert detail.nfs_permissions == ()
+    assert detail.nfs_display_permissions == (
+        NfsDisplayPermission(
+            "10.192.10.0/2",
+            NfsAccessMode.READ_WRITE,
+            async_enabled=True,
+            insecure=True,
+            crossmnt=True,
+            root_squash=NfsRootSquash.ALL_ADMIN,
+        ),
+    )
+
+
+def test_live_kerberos_nfs_detail_preserves_raw_flags_in_all_display_formats() -> None:
+    share = FakeShare(
+        response={
+            "success": True,
+            "data": {"shares": [{"name": "projects"}], "total": 1},
+        }
+    )
+    security_flavor = {
+        "sys": False,
+        "kerberos": True,
+        "kerberos_integrity": True,
+        "kerberos_privacy": False,
+    }
+    raw_rule = {
+        "async": False,
+        "client": "10.192.10.0/24",
+        "crossmnt": False,
+        "insecure": True,
+        "privilege": "rw",
+        "root_squash": "guest",
+        "security_flavor": security_flavor,
+    }
+    client = SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(share),
+        permission_factory=lambda _: FakePermissionApi(
+            {
+                category: _permission_response([])
+                for category in (
+                    "local_user",
+                    "local_group",
+                    "ldap_user",
+                    "ldap_group",
+                )
+            }
+        ),
+        nfs_factory=lambda _: FakeNfsApi(
+            {"success": True, "data": {"enable_nfs": True}},
+            {"success": True},
+            {"success": True, "data": {"rule": [raw_rule]}},
+        ),
+    )
+
+    details = client.list_share_details()
+    table = render_share_details(details, OutputFormat.TABLE)
+    json_value = json.loads(render_share_details(details, OutputFormat.JSON))
+    yaml_value = yaml.safe_load(render_share_details(details, OutputFormat.YAML))
+
+    assert details[0].nfs_permissions[0].security_flavor == NfsSecurityFlavor(
+        sys=False,
+        kerberos=True,
+        kerberos_integrity=True,
+        kerberos_privacy=False,
+    )
+    assert "security_flavors=[kerberos,kerberos_integrity]" in table
+    assert json_value[0]["nfs_permissions"][0]["security_flavor"] == security_flavor
+    assert yaml_value == json_value
+
+
+def test_mutation_safe_nfs_normalization_rejects_live_kerberos_rule() -> None:
+    rule = _nfs_load_response(
+        NfsClientPermission(
+            "10.192.10.20",
+            NfsAccessMode.READ_WRITE,
+            security_flavor=NfsSecurityFlavor(sys=False, kerberos=True),
+        )
+    )["data"]["rule"][0]
+
+    with pytest.raises(ApiError, match="unsupported NFS security flavor"):
+        _normalize_nfs_rule(rule)
+
+
 def test_permission_failure_after_creation_is_partial_operation() -> None:
 
     permission = PermissionSpec(
@@ -1167,3 +1377,261 @@ def test_create_share_redacts_sensitive_patterns_in_logged_fields() -> None:
     assert "share-secret" not in logged
     assert "path-secret" not in logged
     assert "header-secret" not in logged
+
+
+def _lookup_client(permission_api: FakePermissionApi) -> SynShareClient:
+    return SynShareClient(
+        _config(),
+        _logger(),
+        factory=FakeFactory(FakeShare(_response())),
+        permission_factory=lambda config: permission_api,
+    )
+
+
+def test_global_apply_principal_lookup_validates_exact_all_categories() -> None:
+    permission_api = FakePermissionApi(
+        {
+            "local_user": _permission_response(
+                [
+                    {
+                        "name": "Alice",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": False,
+                    }
+                ]
+            ),
+            "local_group": _permission_response(
+                [
+                    {
+                        "name": "administrators",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": True,
+                    }
+                ]
+            ),
+            "ldap_user": _permission_response(
+                [
+                    {
+                        "name": "alice@example.test",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": False,
+                    }
+                ]
+            ),
+            "ldap_group": _permission_response(
+                [
+                    {
+                        "name": "engineering@example.test",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": False,
+                    }
+                ]
+            ),
+        }
+    )
+    permissions = (
+        PermissionSpec(
+            PermissionPrincipalType.LOCAL_USER, "Alice", PermissionAccessMode.READ_ONLY
+        ),
+        PermissionSpec(
+            PermissionPrincipalType.LDAP_USER,
+            "alice@example.test",
+            PermissionAccessMode.READ_ONLY,
+        ),
+        PermissionSpec(
+            PermissionPrincipalType.LDAP_GROUP,
+            "engineering@example.test",
+            PermissionAccessMode.READ_ONLY,
+        ),
+    )
+
+    _lookup_client(permission_api).validate_apply_principals_globally(
+        "lookup", permissions
+    )
+
+    assert permission_api.set_calls == []
+    assert permission_api.get_calls == [
+        ("lookup", "local_user"),
+        ("lookup", "local_group"),
+        ("lookup", "ldap_user"),
+        ("lookup", "ldap_group"),
+    ]
+
+
+def test_global_apply_principal_lookup_missing_is_distinct() -> None:
+    permission_api = FakePermissionApi(
+        {
+            "local_user": _permission_response([]),
+            "local_group": _permission_response(
+                [
+                    {
+                        "name": "administrators",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": True,
+                    }
+                ]
+            ),
+            "ldap_user": _permission_response([]),
+            "ldap_group": _permission_response([]),
+        }
+    )
+
+    with pytest.raises(PrincipalNotFoundError):
+        _lookup_client(permission_api).validate_apply_principals_globally(
+            "lookup",
+            (
+                PermissionSpec(
+                    PermissionPrincipalType.LOCAL_USER,
+                    "alice",
+                    PermissionAccessMode.READ_ONLY,
+                ),
+            ),
+        )
+    assert permission_api.set_calls == []
+
+
+def test_global_apply_principal_lookup_rejects_malformed_and_duplicate_inventory() -> (
+    None
+):
+    malformed = FakePermissionApi(
+        {
+            "local_user": {
+                "success": True,
+                "data": {"items": [{"name": "alice"}], "total": 1},
+            },
+            "local_group": _permission_response(
+                [
+                    {
+                        "name": "administrators",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": True,
+                    }
+                ]
+            ),
+        }
+    )
+    with pytest.raises(ApiError):
+        _lookup_client(malformed).validate_apply_principals_globally(
+            "lookup",
+            (
+                PermissionSpec(
+                    PermissionPrincipalType.LOCAL_USER,
+                    "alice",
+                    PermissionAccessMode.READ_ONLY,
+                ),
+            ),
+        )
+
+    duplicate = FakePermissionApi(
+        {
+            "local_user": _permission_response(
+                [
+                    {
+                        "name": "alice",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": False,
+                    },
+                    {
+                        "name": "alice",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": False,
+                    },
+                ]
+            ),
+            "local_group": _permission_response(
+                [
+                    {
+                        "name": "administrators",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": True,
+                    }
+                ]
+            ),
+        }
+    )
+    with pytest.raises(ApiError):
+        _lookup_client(duplicate).validate_apply_principals_globally(
+            "lookup",
+            (
+                PermissionSpec(
+                    PermissionPrincipalType.LOCAL_USER,
+                    "alice",
+                    PermissionAccessMode.READ_ONLY,
+                ),
+            ),
+        )
+
+
+def test_global_apply_principal_lookup_completes_paginated_inventory() -> None:
+    class PagedPermissionApi:
+        def __init__(self) -> None:
+            self.set_calls: list[object] = []
+            self.get_calls: list[tuple[str, str, int]] = []
+            self.principals = [
+                {
+                    "name": f"user-{number}",
+                    "is_deny": False,
+                    "is_readonly": False,
+                    "is_writable": False,
+                }
+                for number in range(51)
+            ]
+
+        def set_folder_permissions(self, name, user_group_type, permissions):
+            self.set_calls.append((name, user_group_type, permissions))
+            return {"success": True}
+
+        def get_folder_permissions(
+            self,
+            name,
+            offset=0,
+            limit=50,
+            is_unite_permission=False,
+            with_inherit=False,
+            user_group_type="local_user",
+        ):
+            self.get_calls.append((name, user_group_type, offset))
+            items = (
+                self.principals[offset : offset + limit]
+                if user_group_type == "local_user"
+                else [
+                    {
+                        "name": "administrators",
+                        "is_deny": False,
+                        "is_readonly": False,
+                        "is_writable": True,
+                    }
+                ]
+            )
+            total = len(self.principals) if user_group_type == "local_user" else 1
+            return {"success": True, "data": {"items": items, "total": total}}
+
+    permission_api = PagedPermissionApi()
+    _lookup_client(permission_api).validate_apply_principals_globally(
+        "lookup",
+        (
+            PermissionSpec(
+                PermissionPrincipalType.LOCAL_USER,
+                "user-50",
+                PermissionAccessMode.READ_ONLY,
+            ),
+        ),
+    )
+
+    assert permission_api.set_calls == []
+    assert permission_api.get_calls == [
+        ("lookup", "local_user", 0),
+        ("lookup", "local_user", 50),
+        ("lookup", "local_group", 0),
+        ("lookup", "ldap_user", 0),
+        ("lookup", "ldap_group", 0),
+    ]

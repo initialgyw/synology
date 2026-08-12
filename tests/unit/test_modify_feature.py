@@ -20,6 +20,7 @@ from synology.models import (
     ConnectionConfig,
     NfsAccessMode,
     NfsClientPermission,
+    NfsRootSquash,
     OperationStatus,
     OutputFormat,
     PermissionAccessMode,
@@ -367,7 +368,7 @@ def _nfs_rule(permission: NfsClientPermission) -> dict[str, object]:
         "privilege": "rw"
         if permission.access_mode is NfsAccessMode.READ_WRITE
         else "ro",
-        "root_squash": permission.root_squash,
+        "root_squash": permission.root_squash.value,
         "security_flavor": {
             "sys": permission.security_flavor.sys,
             "kerberos": permission.security_flavor.kerberos,
@@ -435,6 +436,59 @@ def test_modify_nfs_empty_value_plan_clears_rules_without_credentials() -> None:
     assert result == 11
     assert json.loads(stdout.getvalue())["nfs_permissions"] == []
     assert stderr.getvalue() == ""
+    assert factory.config is None
+
+
+@pytest.mark.parametrize("root_squash", list(NfsRootSquash))
+def test_modify_nfs_permission_parses_exact_dsm_root_squash_tokens(
+    root_squash: NfsRootSquash,
+) -> None:
+    factory = CliFactory(CliClient())
+
+    result, stdout, stderr = _run_cli(
+        [
+            "modify-share",
+            "projects",
+            "--nfs-permission",
+            "client=10.0.0.1,access=read-write,root_squash=" + root_squash.value,
+            "--output",
+            "json",
+        ],
+        factory,
+        environment={},
+    )
+
+    assert result == 11
+    assert json.loads(stdout.getvalue())["nfs_permissions"][0]["root_squash"] == (
+        root_squash.value
+    )
+    assert stderr.getvalue() == ""
+    assert factory.config is None
+
+
+@pytest.mark.parametrize(
+    "root_squash",
+    ["no_root_squash", "none", "all_squash", "map_root", "ROOT", "Admin", "unknown"],
+)
+def test_modify_nfs_permission_rejects_non_dsm_root_squash_tokens(
+    root_squash: str,
+) -> None:
+    factory = CliFactory(CliClient())
+
+    result, stdout, stderr = _run_cli(
+        [
+            "modify-share",
+            "projects",
+            "--nfs-permission",
+            "client=10.0.0.1,access=read-write,root_squash=" + root_squash,
+        ],
+        factory,
+        environment={},
+    )
+
+    assert result == 10
+    assert stdout.getvalue() == ""
+    assert "root_squash" in stderr.getvalue()
     assert factory.config is None
 
 
@@ -890,6 +944,75 @@ def test_modify_acl_patch_reconciles_desired_and_stale_ldap_entries() -> None:
         for entry in api.entries[category]
     )
     assert result.steps[-1].status is OperationStatus.SUCCEEDED
+
+
+def test_apply_acl_replacement_revokes_unrequested_admin_group_and_keeps_default() -> (
+    None
+):
+    api = MutablePermissionApi(
+        {
+            "local_group": [
+                {
+                    **_permission_entry("administrators", writable=True),
+                    "is_admin": True,
+                },
+                {**_permission_entry("other-admins", writable=True), "is_admin": True},
+            ],
+        }
+    )
+    _client(permission_api=api).replace_apply_acl("projects", ())
+    entries = {item["name"]: item for item in api.entries["local_group"]}
+    assert entries["administrators"]["is_writable"] is True
+    assert entries["other-admins"]["is_writable"] is False
+
+
+def test_apply_acl_replacement_corrects_default_administrators_mode() -> None:
+    api = MutablePermissionApi(
+        {
+            "local_group": [
+                {
+                    **_permission_entry("administrators", readonly=True),
+                    "is_admin": True,
+                },
+            ],
+        }
+    )
+    _client(permission_api=api).replace_apply_acl("projects", ())
+    assert api.entries["local_group"][0]["is_writable"] is True
+    assert api.entries["local_group"][0]["is_readonly"] is False
+
+
+def test_apply_acl_replacement_fails_when_admin_group_survives_write() -> None:
+    class SurvivingAdminGroupApi(MutablePermissionApi):
+        def set_folder_permissions(self, name, user_group_type, permissions):
+            response = super().set_folder_permissions(
+                name, user_group_type, permissions
+            )
+            if user_group_type == "local_group":
+                for entry in self.entries[user_group_type]:
+                    if entry["name"] == "other-admins":
+                        entry["is_deny"] = False
+                        entry["is_readonly"] = False
+                        entry["is_writable"] = True
+            return response
+
+    api = SurvivingAdminGroupApi(
+        {
+            "local_group": [
+                {
+                    **_permission_entry("administrators", writable=True),
+                    "is_admin": True,
+                },
+                {**_permission_entry("other-admins", writable=True), "is_admin": True},
+            ],
+        }
+    )
+    with pytest.raises(PartialOperationError):
+        _client(permission_api=api).replace_apply_acl("projects", ())
+    assert any(
+        entry["name"] == "administrators" and entry["is_writable"]
+        for entry in api.entries["local_group"]
+    )
 
 
 def test_modify_clear_acl_revokes_admin_users_preserves_admin_groups() -> None:

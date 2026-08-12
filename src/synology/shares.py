@@ -17,6 +17,7 @@ from synology_api.exceptions import (
 from synology.config import (
     QUOTA_MIB_PER_GIB,
     normalize_nfs_client,
+    validate_share_create_request,
     validate_share_modify_request,
 )
 from synology.exceptions import (
@@ -39,12 +40,17 @@ from synology.models import (
     MutableShareState,
     NfsAccessMode,
     NfsClientPermission,
+    NfsDisplayPermission,
+    NfsRootSquash,
     NfsSecurityFlavor,
     OperationStatus,
     PermissionAccessMode,
     PermissionPrincipalType,
     PermissionSpec,
     PermissionStatus,
+    PrincipalIdentity,
+    PrincipalLookupRequest,
+    PrincipalLookupResult,
     ShareCreateRequest,
     ShareCreateResult,
     ShareDeleteRequest,
@@ -189,6 +195,7 @@ class SynShareClient:
         self._nfs: NfsRawApi | None = None
 
     def create_share(self, request: ShareCreateRequest) -> ShareCreateResult:
+        request = validate_share_create_request(request)
         self._logger.debug(
             "Synology API create request operation=%s target=%s:%s tls_verify=%s "
             "request=%s",
@@ -472,11 +479,17 @@ class SynShareClient:
         desired = request.permissions
         assert desired is not None
         deltas = _permission_deltas(
-            current, desired, clear_mode=request._acl_clear_mode
+            current,
+            desired,
+            clear_mode=request._acl_clear_mode,
+            authoritative_mode=request._acl_authoritative_mode,
         )
         if (
             _compare_modify_permissions(
-                current, desired, clear_mode=request._acl_clear_mode
+                current,
+                desired,
+                clear_mode=request._acl_clear_mode,
+                authoritative_mode=request._acl_authoritative_mode,
             )
             is None
         ):
@@ -544,6 +557,7 @@ class SynShareClient:
                 ),
                 desired,
                 clear_mode=request._acl_clear_mode,
+                authoritative_mode=request._acl_authoritative_mode,
             )
         except Exception as exc:
             status = _permission_failure_status(exc)
@@ -689,6 +703,181 @@ class SynShareClient:
             steps=tuple(steps),
         )
 
+    def read_apply_details(self, name: str) -> ShareDetails:
+        """Read complete normalized state for one configured share."""
+        try:
+            state = _read_mutable_share_state(cast(ShareQuotaRawApi, self._share), name)
+            inventory = _read_modify_permission_inventory(self._permission_api(), name)
+            nfs_api = self._nfs_api()
+            if not _global_nfs_enabled(nfs_api):
+                raise ApiError("global NFS must already be enabled")
+            nfs_display = _load_nfs_rule_display_permissions(nfs_api, name)
+            nfs = _mutation_safe_nfs_display_permissions(nfs_display)
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="apply-preflight")
+        return ShareDetails(
+            share=ShareRecord(
+                name=state.name,
+                volume=state.volume_path,
+                description=state.description,
+                quota_gib=state.quota.gib,
+                quota_api_value=state.quota.api_value,
+            ),
+            acl_permissions=tuple(
+                AclPermissionRecord(
+                    item.name,
+                    item.category,
+                    item.access_mode is PermissionAccessMode.DENY,
+                    item.access_mode is PermissionAccessMode.READ_ONLY,
+                    item.access_mode is PermissionAccessMode.READ_WRITE,
+                    item.is_custom,
+                    item.is_admin,
+                )
+                for item in _active_modify_permissions(inventory)
+            ),
+            nfs_permissions=nfs,
+            acl_status=EnrichmentStatus.AVAILABLE
+            if inventory
+            else EnrichmentStatus.EMPTY,
+            nfs_status=(
+                EnrichmentStatus.AVAILABLE if nfs_display else EnrichmentStatus.EMPTY
+            ),
+            nfs_display_permissions=nfs_display,
+        )
+
+    def validate_apply_principals(
+        self, name: str, permissions: tuple[PermissionSpec, ...]
+    ) -> None:
+        try:
+            _validate_requested_principals(
+                _read_modify_permission_inventory(self._permission_api(), name),
+                (
+                    *permissions,
+                    PermissionSpec(
+                        PermissionPrincipalType.LOCAL_GROUP,
+                        "administrators",
+                        PermissionAccessMode.READ_WRITE,
+                    ),
+                ),
+            )
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="apply-principal-preflight")
+
+    def validate_apply_principals_globally(
+        self, lookup_share: str, permissions: tuple[PermissionSpec, ...]
+    ) -> None:
+        """Validate apply ACL principals via a read-only existing-share inventory."""
+        request = PrincipalLookupRequest(
+            lookup_share,
+            (
+                *(
+                    PrincipalIdentity(
+                        permission.principal_type, permission.principal_name
+                    )
+                    for permission in permissions
+                ),
+                PrincipalIdentity(
+                    PermissionPrincipalType.LOCAL_GROUP, "administrators"
+                ),
+            ),
+        )
+        try:
+            result = _read_apply_principal_lookup(self._permission_api(), request)
+            _validate_lookup_result(request, result)
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="apply-principal-preflight")
+
+    def preflight_apply_create(self) -> None:
+        """Validate create-time API capabilities without creating a share."""
+        try:
+            _share_set_version(cast(ShareQuotaRawApi, self._share))
+            self._permission_api()
+            nfs_api = self._nfs_api()
+            if not _global_nfs_enabled(nfs_api):
+                raise ApiError("global NFS must already be enabled")
+            info = nfs_api.core_list.get(NFS_SHARE_PRIVILEGE_API)
+            if not isinstance(info, Mapping):
+                raise ApiError("NAS does not support the required NFS API")
+            _required_api_version(info, 1)
+        except ConfigurationError as exc:
+            raise ApiError(
+                "NAS does not support required apply-config capability"
+            ) from exc
+        except Exception as exc:
+            self._raise_mapped_error(exc, phase="apply-create-preflight")
+
+    def update_complete_share(
+        self, name: str, description: str, quota_mib: int
+    ) -> None:
+        api = cast(ShareQuotaRawApi, self._share)
+        try:
+            version = _share_set_version(api)
+            current = _read_mutable_share_state(api, name)
+            desired = MutableShareState(
+                current.name,
+                current.volume_path,
+                description,
+                current.hidden,
+                current.recycle_bin_enabled,
+                current.recycle_bin_admin_only,
+                current.compression_enabled,
+                current.cow_enabled,
+                ShareQuotaState(quota_mib),
+            )
+            payload = _quota_set_payload(desired, version, quota_mib)
+            response = api.request_data(
+                SHARE_SET_API,
+                cast(str, api.core_list[SHARE_SET_API]["path"]),
+                {
+                    "version": payload.version,
+                    "method": "set",
+                    "name": payload.name,
+                    "shareinfo": payload.shareinfo,
+                },
+                method="post",
+            )
+            if (
+                _as_mapping(response, "invalid share update response").get("success")
+                is not True
+            ):
+                raise ApiError("NAS API returned an unsuccessful share update response")
+            observed = _read_mutable_share_state(api, name)
+            if (
+                observed.description != description
+                or observed.quota.api_value != quota_mib
+                or not _share_state_preserved(desired, observed)
+            ):
+                raise PartialOperationError(
+                    "complete share update verification failed", None
+                )
+        except PartialOperationError:
+            raise
+        except Exception as exc:
+            raise PartialOperationError(
+                "complete share update outcome is uncertain", None
+            ) from exc
+
+    def replace_apply_acl(
+        self, name: str, permissions: tuple[PermissionSpec, ...]
+    ) -> None:
+        protected = PermissionSpec(
+            PermissionPrincipalType.LOCAL_GROUP,
+            "administrators",
+            PermissionAccessMode.READ_WRITE,
+        )
+        self.modify_share(
+            ShareModifyRequest(
+                name=name,
+                permissions=(*permissions, protected),
+                _acl_authoritative_mode=True,
+            )
+        )
+
+    def replace_apply_nfs(
+        self, name: str, permissions: tuple[NfsClientPermission, ...]
+    ) -> None:
+        self.modify_share(ShareModifyRequest(name=name, nfs_permissions=permissions))
+
     def delete_share(self, request: ShareDeleteRequest) -> ShareDeleteResult:
         self._logger.debug(
             "Synology API delete request operation=%s target=%s:%s tls_verify=%s "
@@ -767,12 +956,20 @@ class SynShareClient:
                         type(exc).__name__,
                     )
             try:
-                nfs = _load_nfs_rules(nfs_api, share.name)
+                nfs_display = _load_nfs_rule_display_permissions(nfs_api, share.name)
+                nfs = tuple(
+                    permission
+                    for permission in nfs_display
+                    if isinstance(permission, NfsClientPermission)
+                )
                 nfs_status = (
-                    EnrichmentStatus.AVAILABLE if nfs else EnrichmentStatus.EMPTY
+                    EnrichmentStatus.AVAILABLE
+                    if nfs_display
+                    else EnrichmentStatus.EMPTY
                 )
             except Exception as exc:
                 nfs = ()
+                nfs_display = ()
                 nfs_status = EnrichmentStatus.UNAVAILABLE
                 diagnostics.append(
                     EnrichmentDiagnostic(share.name, "NFS enrichment failed", "nfs")
@@ -797,6 +994,7 @@ class SynShareClient:
                     ),
                     nfs_status=nfs_status,
                     diagnostics=tuple(diagnostics),
+                    nfs_display_permissions=nfs_display,
                 )
             )
         return tuple(details)
@@ -1214,6 +1412,7 @@ def _load_nfs_rules(
     api: NfsRawApi,
     share_name: str,
 ) -> tuple[NfsClientPermission, ...]:
+    """Load mutation-safe NFS rules, rejecting unsupported live state."""
     info = api.core_list[NFS_SHARE_PRIVILEGE_API]
     response = api.request_data(
         NFS_SHARE_PRIVILEGE_API,
@@ -1233,6 +1432,46 @@ def _load_nfs_rules(
     return tuple(_normalize_nfs_rule(rule) for rule in rules)
 
 
+def _load_nfs_rule_display_permissions(
+    api: NfsRawApi,
+    share_name: str,
+) -> tuple[NfsClientPermission | NfsDisplayPermission, ...]:
+    info = api.core_list[NFS_SHARE_PRIVILEGE_API]
+    response = api.request_data(
+        NFS_SHARE_PRIVILEGE_API,
+        cast(str, info["path"]),
+        {
+            "version": _required_api_version(info, 1),
+            "method": "load",
+            "share_name": json.dumps(share_name),
+        },
+        method="get",
+    )
+    envelope = _as_mapping(response, "invalid NFS load response")
+    if envelope.get("success") is not True:
+        raise ApiError("NAS API returned an unsuccessful NFS load response")
+    data = _as_mapping(envelope.get("data"), "invalid NFS load response data")
+    rules = _as_sequence(data.get("rule"), "invalid NFS load response rules")
+    return tuple(_normalize_nfs_display_rule(rule) for rule in rules)
+
+
+def _mutation_safe_nfs_display_permissions(
+    permissions: tuple[NfsClientPermission | NfsDisplayPermission, ...],
+) -> tuple[NfsClientPermission, ...]:
+    """Reject display-only or unsupported NFS state before reconciliation."""
+    if any(
+        not isinstance(permission, NfsClientPermission) for permission in permissions
+    ):
+        raise ApiError("invalid NFS rule")
+    safe_permissions = cast(tuple[NfsClientPermission, ...], permissions)
+    if any(
+        permission.security_flavor != NfsSecurityFlavor()
+        for permission in safe_permissions
+    ):
+        raise ApiError("unsupported NFS security flavor")
+    return safe_permissions
+
+
 def _nfs_rule(permission: NfsClientPermission) -> dict[str, object]:
     return {
         "async": permission.async_enabled,
@@ -1242,7 +1481,7 @@ def _nfs_rule(permission: NfsClientPermission) -> dict[str, object]:
         "privilege": "rw"
         if permission.access_mode is NfsAccessMode.READ_WRITE
         else "ro",
-        "root_squash": permission.root_squash,
+        "root_squash": permission.root_squash.value,
         "security_flavor": {
             "sys": permission.security_flavor.sys,
             "kerberos": permission.security_flavor.kerberos,
@@ -1253,6 +1492,14 @@ def _nfs_rule(permission: NfsClientPermission) -> dict[str, object]:
 
 
 def _normalize_nfs_rule(value: object) -> NfsClientPermission:
+    """Normalize a live NFS rule only when it is safe for reconciliation."""
+    permission = _normalize_nfs_display_rule(value)
+    return _mutation_safe_nfs_display_permissions((permission,))[0]
+
+
+def _normalize_nfs_display_rule(
+    value: object,
+) -> NfsClientPermission | NfsDisplayPermission:
     rule = _as_mapping(value, "invalid NFS rule")
     client = rule.get("client")
     privilege = rule.get("privilege")
@@ -1267,12 +1514,12 @@ def _normalize_nfs_rule(value: object) -> NfsClientPermission:
         or not isinstance(async_enabled, bool)
         or not isinstance(insecure, bool)
         or not isinstance(crossmnt, bool)
-        or root_squash != "root"
+        or not isinstance(root_squash, str)
     ):
         raise ApiError("invalid NFS rule")
     try:
-        canonical_client = normalize_nfs_client(client)[0]
-    except ConfigurationError as exc:
+        canonical_root_squash = NfsRootSquash(root_squash)
+    except ValueError as exc:
         raise ApiError("invalid NFS rule") from exc
     security_flavor = NfsSecurityFlavor(
         sys=_nfs_security_value(security, "sys"),
@@ -1280,17 +1527,28 @@ def _normalize_nfs_rule(value: object) -> NfsClientPermission:
         kerberos_integrity=_nfs_security_value(security, "kerberos_integrity"),
         kerberos_privacy=_nfs_security_value(security, "kerberos_privacy"),
     )
-    if security_flavor != NfsSecurityFlavor():
-        raise ApiError("invalid NFS security flavor")
+    access_mode = (
+        NfsAccessMode.READ_WRITE if privilege == "rw" else NfsAccessMode.READ_ONLY
+    )
+    try:
+        canonical_client = normalize_nfs_client(client)[0]
+    except ConfigurationError:
+        return NfsDisplayPermission(
+            client=client,
+            access_mode=access_mode,
+            async_enabled=async_enabled,
+            insecure=insecure,
+            crossmnt=crossmnt,
+            root_squash=canonical_root_squash,
+            security_flavor=security_flavor,
+        )
     return NfsClientPermission(
         client=canonical_client,
-        access_mode=(
-            NfsAccessMode.READ_WRITE if privilege == "rw" else NfsAccessMode.READ_ONLY
-        ),
+        access_mode=access_mode,
         async_enabled=async_enabled,
         insecure=insecure,
         crossmnt=crossmnt,
-        root_squash="root",
+        root_squash=canonical_root_squash,
         security_flavor=security_flavor,
     )
 
@@ -1316,7 +1574,7 @@ def _nfs_sort_key(permission: NfsClientPermission) -> tuple[object, ...]:
         permission.async_enabled,
         permission.insecure,
         permission.crossmnt,
-        permission.root_squash,
+        permission.root_squash.value,
         permission.security_flavor.sys,
         permission.security_flavor.kerberos,
         permission.security_flavor.kerberos_integrity,
@@ -1513,6 +1771,7 @@ def _permission_deltas(
     desired: tuple[PermissionSpec, ...],
     *,
     clear_mode: bool = False,
+    authoritative_mode: bool = False,
 ) -> dict[str, tuple[list[dict[str, object]], int, int]]:
     current_by_identity: dict[tuple[str, str], AclPermissionState] = {}
     for current_permission in current:
@@ -1555,11 +1814,13 @@ def _permission_deltas(
             if (
                 permission_category == category
                 and (
-                    not actual_permission.is_admin
+                    authoritative_mode
+                    or not actual_permission.is_admin
                     or (clear_mode and actual_permission.category != "local_group")
                 )
                 and not (
-                    actual_permission.category == "local_group"
+                    not authoritative_mode
+                    and actual_permission.category == "local_group"
                     and actual_permission.name == "administrators"
                 )
                 and (permission_category, principal_name) not in desired_by_identity
@@ -1662,6 +1923,69 @@ def _validate_requested_principals(
         raise PrincipalNotFoundError(missing)
 
 
+def _read_apply_principal_lookup(
+    api: SharePermissionApi,
+    request: PrincipalLookupRequest,
+) -> PrincipalLookupResult:
+    """Read and validate every DSM principal category from the lookup share."""
+    found: set[PrincipalIdentity] = set()
+    for category in PERMISSION_USER_GROUP_TYPES:
+        for value in _read_permission_category(api, request.lookup_share, category):
+            principal, _ = _modify_permission_inventory_item(value, category)
+            identity = PrincipalIdentity(
+                _principal_type_from_permission_category(principal.category),
+                principal.name,
+            )
+            if identity in found:
+                raise ApiError("duplicate permission inventory principal")
+            found.add(identity)
+    return PrincipalLookupResult(
+        request.lookup_share,
+        tuple(sorted(found, key=lambda item: (item.principal_type.value, item.name))),
+    )
+
+
+def _validate_lookup_result(
+    request: PrincipalLookupRequest, result: PrincipalLookupResult
+) -> None:
+    """Raise when the complete lookup inventory lacks a requested identity."""
+    if result.lookup_share != request.lookup_share:
+        raise ApiError("invalid principal lookup response")
+    found = set(result.identities)
+    missing = tuple(
+        AclPrincipal(
+            identity.name, _permission_type_from_principal_type(identity.principal_type)
+        )
+        for identity in request.identities
+        if identity not in found
+    )
+    if missing:
+        raise PrincipalNotFoundError(missing)
+
+
+def _permission_type_from_principal_type(
+    principal_type: PermissionPrincipalType,
+) -> str:
+    return {
+        PermissionPrincipalType.LOCAL_USER: "local_user",
+        PermissionPrincipalType.LOCAL_GROUP: "local_group",
+        PermissionPrincipalType.LDAP_USER: "ldap_user",
+        PermissionPrincipalType.LDAP_GROUP: "ldap_group",
+    }[principal_type]
+
+
+def _principal_type_from_permission_category(category: str) -> PermissionPrincipalType:
+    try:
+        return {
+            "local_user": PermissionPrincipalType.LOCAL_USER,
+            "local_group": PermissionPrincipalType.LOCAL_GROUP,
+            "ldap_user": PermissionPrincipalType.LDAP_USER,
+            "ldap_group": PermissionPrincipalType.LDAP_GROUP,
+        }[category]
+    except KeyError as exc:
+        raise ApiError("invalid permission inventory category") from exc
+
+
 def _read_permission_category(
     api: SharePermissionApi, name: str, category: str
 ) -> tuple[object, ...]:
@@ -1744,6 +2068,7 @@ def _compare_modify_permissions(
     expected: tuple[PermissionSpec, ...],
     *,
     clear_mode: bool = False,
+    authoritative_mode: bool = False,
 ) -> str | None:
     expected_by_identity = {
         (
@@ -1766,9 +2091,10 @@ def _compare_modify_permissions(
     for identity, actual_entries in actual_by_identity.items():
         if identity in expected_by_identity:
             continue
-        if clear_mode:
+        if authoritative_mode or clear_mode:
             if any(
-                permission.category != "local_group"
+                authoritative_mode
+                or permission.category != "local_group"
                 or (permission.name != "administrators" and not permission.is_admin)
                 for permission in actual_entries
             ):

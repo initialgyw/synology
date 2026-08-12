@@ -88,7 +88,7 @@ syn-cli list-shares --permissions
 syn-cli list-shares --permissions --output json
 ```
 
-Permission tables add `PERMISSION` and `NFS-PERMISSIONS`; long values may occupy continuation lines with blank metadata cells. Empty details are distinct from unavailable details. Unavailable details render as `?`, diagnostics are written to stderr, and the command returns exit code `60` while preserving available rows. Structured output retains UUIDs and full permission/NFS details.
+Permission tables add `PERMISSION` and `NFS-PERMISSIONS`; long values may occupy continuation lines with blank metadata cells. The active protected `local_group:administrators:read-write` ACL is hidden only from this display (including JSON and YAML); it remains in live state, reconciliation, apply payloads, and verification. Other ACLs remain visible, and a protected-only ACL displays as `-` or `[]` in structured output. NFS detail rows use `client:access,squash=<root|admin|guest|all_admin|all_guest>,security_flavors=[<enabled flavors>],async=<true|false>,insecure=<true|false>,crossmnt=<true|false>`, listing enabled live flavors in the deterministic order `sys`, `kerberos`, `kerberos_integrity`, and `kerberos_privacy` (or `[]` when none are enabled). This read-only display preserves the actual four DSM security-flavor booleans, including GUI-created Kerberos modes. A malformed live client is shown using its raw client value with the same fields, but it remains unsafe for apply-config reconciliation. This malformed-live-rule display behavior applies only to `list-shares --permissions` detail output; `create-share` and `modify-share` results represent their requested or mutation state and do not include unrelated live rules. Empty details are distinct from unavailable details: structured `nfs_permissions` is `[]` for a known empty NFS read and `null` when NFS is unavailable; tables render unavailable NFS as `?`. Diagnostics are written to stderr, and the command returns exit code `60` while preserving available rows. Structured output retains UUIDs and full permission/NFS details without internal observations fields.
 Quota data is requested from DSM using the `share_quota` selector and returned by DSM
 as `quota_value`. JSON and YAML include `quota_gib`, `quota_api_value`, and
 `quota_api_unit`. Missing quotas display as `-`.
@@ -312,7 +312,7 @@ performed.
 NFS rules use repeatable comma-separated key/value specifications:
 
 ```text
-client=CLIENT,access=read-only|read-write
+client=CLIENT,access=read-only|read-write[,root_squash=root|admin|guest|all_admin|all_guest]
 ```
 
 A literal IPv4 client:
@@ -353,14 +353,26 @@ Optional operational flags:
 syn-cli create-share nfs-data \
   --path /volume1 \
   --nfs-permission \
-  'client=10.192.10.0/24,access=read-write,async=true,insecure=true,crossmnt=true' \
+  'client=10.192.10.0/24,access=read-write,root_squash=root,async=true,insecure=true,crossmnt=true' \
   --yes
 ```
 
+`root_squash` is optional and defaults to `root`. Every NFS CLI entry point, including
+`create-share` and `modify-share`, accepts only these exact raw DSM v1 tokens:
+`root`, `admin`, `guest`, `all_admin`, and `all_guest`. Linux NFS aliases such as
+`no_root_squash`, `none`, `all_squash`, and `map_root`, case variants, empty values, and
+unknown values are rejected rather than translated. Desired CLI rules use only the DSM
+`security_flavor` of `[sys]`; Kerberos flavors cannot be selected or reconciled. In
+contrast, `list-shares --permissions` is read-only and displays actual live Kerberos
+flavor booleans when DSM reports them. Desired clients must be canonical IP addresses, CIDRs, or `*`; malformed or noncanonical CIDRs such as
+`10.192.10.0/2` are rejected before a client is constructed or any NAS write is attempted.
+
 Defaults are synchronous writes, privileged source ports, no cross-mounts, root
-squashing, and AUTH_SYS security. `insecure=true` permits non-privileged source ports;
-`crossmnt=true` broadens filesystem visibility; and `async=true` may reduce durability
-under failure. Wildcards and broad subnets can expose the share widely.
+squashing, and AUTH_SYS (`[sys]`) security. `insecure=true` permits non-privileged source
+ports; `crossmnt=true` broadens filesystem visibility; and `async=true` may reduce
+durability under failure. Wildcards and broad subnets can expose the share widely.
+`admin` and `all_admin` map access to the administrator identity, while `all_admin` and
+`all_guest` map every user; review non-default identity mappings before applying them.
 
 Global NFS must already be enabled. `create-share` never enables or changes the global
 NFS service. Supplied NFS entries replace the complete NFS rule set. The command saves
@@ -376,7 +388,7 @@ It does not support append, remove, selectors, or merge modes.
 ```bash
 syn-cli modify-share projects --permission 'local-user:alice:read-write'
 syn-cli modify-share projects --permission '' --yes
-syn-cli modify-share projects --nfs-permission 'client=10.192.10.0/24,access=read-write' --yes
+syn-cli modify-share projects --nfs-permission 'client=10.192.10.0/24,access=read-write,root_squash=guest' --yes
 syn-cli modify-share projects --nfs-permission '' --yes
 syn-cli modify-share projects --quota 0
 ```
@@ -398,10 +410,18 @@ exactly one empty value is valid; repeated empty values or an empty value mixed 
 nonempty value are rejected.
 
 NFS replacement saves the complete supplied NFS rule list; `--nfs-permission ''` saves
-an empty list. Omit `--nfs-permission` to leave NFS unselected. For each repeatable NFS
-option, exactly one empty value is valid; repeated empty values or an empty value mixed
-with a nonempty value are rejected. Global NFS is not enabled, disabled, or otherwise
-changed by this command.
+an empty list. The rule syntax is
+`client=CLIENT,access=read-only|read-write[,root_squash=root|admin|guest|all_admin|all_guest]`.
+`root_squash` defaults to `root`; only the five exact raw DSM tokens listed above are
+accepted. Linux aliases (`no_root_squash`, `none`, `all_squash`, and `map_root`), case
+variants, missing or empty values, and other values are rejected. Rules are limited to
+DSM `security_flavor: [sys]`; Kerberos flavors are not supported. Non-default mappings
+change the NAS identity used for access; `admin` and `all_admin` are privileged, and
+`all_admin` and `all_guest` affect all users. Review these settings before `--yes`.
+Omit `--nfs-permission` to leave NFS unselected. For each repeatable NFS option, exactly
+one empty value is valid; repeated empty values or an empty value mixed with a nonempty
+value are rejected. Global NFS is not enabled, disabled, or otherwise changed by this
+command.
 
 `--quota` accepts a nonnegative integer in GiB. Positive values are converted to DSM's
 MiB API unit (`5 GiB` is sent as `5120 MiB`); `--quota 0` clears the limit and reports
@@ -430,7 +450,7 @@ the NAS may have accepted it, and the output marks the outcome as unknown.
 | `20` | Authentication or authorization failure |
 | `30` | Transport, TLS, or network failure |
 | `40` | Synology API or malformed-response failure |
-| `41` | Requested `modify-share` ACL principal was not found in DSM inventory |
+| `41` | Requested ACL principal was not found in a complete DSM inventory |
 | `50` | Output or serialization failure |
 | `60` | Partial or uncertain mutation outcome |
 | `70` | Unexpected internal failure |
@@ -447,3 +467,90 @@ For exit `60`, inspect the structured output and DSM. The share may exist while 
 NFS configuration is incomplete or uncertain. Correct the resulting state manually or
 run a targeted remediation command after confirming the current NAS state. No automatic
 share deletion or retry is performed.
+
+## Apply configuration
+
+`apply-config` reconciles only shares explicitly named in a strict, single-target V1
+YAML document; omitted live shares remain untouched. See
+[`examples/apply-config-v1.yaml`](examples/apply-config-v1.yaml).
+
+```bash
+syn-cli apply-config examples/apply-config-v1.yaml
+syn-cli apply-config examples/apply-config-v1.yaml --yes --output json
+```
+
+The root must be a mapping with `version: 1` and `volumes`. `host` and
+`principal_lookup_share` are optional. `principal_lookup_share`, when supplied, is the
+exact name of an existing live share used only for read-only DSM ACL principal inventory;
+it cannot be configured as `state: absent`. Each absolute volume path maps to `shares`;
+share fields are `name`, `state`, `description`, `quota`, `acl`, and `nfs`. Unknown
+fields, duplicate YAML keys, malformed values, duplicate share names, duplicate ACL
+identities, and duplicate normalized NFS clients are rejected. `state` defaults to
+`present`; `state: absent` permits only `name` and `state`.
+
+`quota` is an integer GiB value in the supported API range. Omitted quota means DSM
+unlimited (`0 MiB`) and changes finite quotas to unlimited. Omitted descriptions preserve
+an existing description and use an empty description for new shares; an explicit empty
+string clears it. Omitted ACLs and `entries: []` clear mutable ACL entries while preserving
+`local_group:administrators:read-write`. Omitted NFS and `rules: []` clear all NFS rules.
+NFS V1 accepts only these exact DSM `root_squash` tokens and
+`security_flavors: [sys]`:
+
+| Token | Verified DSM UI meaning |
+| --- | --- |
+| `root` | No mapping |
+| `admin` | Map root to admin |
+| `guest` | Map root to guest |
+| `all_admin` | Map all users to admin |
+| `all_guest` | Map all users to guest |
+
+These values were verified through read-only DSM `SharePrivilege.load` responses on
+named mapping test shares. They are raw DSM v1 values, not Linux NFS aliases:
+`no_root_squash`, `none`, `all_squash`, `map_root`, case variants, missing values, and
+wrong types are rejected with exit `10` rather than mapped. This DSM target rejected
+`no_root_squash` and `none` in prior disposable save tests. Desired Kerberos or
+omitted/malformed flavors are also rejected. Read-only `list-shares --permissions`
+continues to display valid live Kerberos booleans for inspection, but apply-config fails
+closed before writing a managed share whose live NFS state is not exactly `[sys]`.
+
+The non-default mappings alter the identity DSM uses for NFS access. In particular,
+`admin` and `all_admin` map access to the administrator identity and are privileged
+mappings; `all_admin` and `all_guest` apply to all users, not only root. Dry-run and
+apply output warn for every non-default mapping, with additional privileged-mapping
+warnings for `admin` and `all_admin`; review the exact plan before supplying the sole
+apply confirmation, `--yes`. For Kubernetes NFS clients, prefer a narrowly scoped
+client CIDR and `root` unless the workload's UID/GID and required access have been
+reviewed; do not select an administrator mapping merely to resolve a container
+permission error.
+
+NFS is full-rule replacement: omitted `nfs`, `rules: []`, or an empty desired rule set
+removes every NFS client rule for that managed share. Apply-config compares rules without
+regard to order, saves the complete replacement, and reads it back. An unknown live DSM
+token or malformed live NFS response fails before mutation with exit `40`; a post-save
+read-back mismatch is a partial outcome with exit `60`. `list-shares --permissions`
+preserves a GUI-created malformed client CIDR as its raw `client:access` value for
+inspection, but apply-config refuses to reconcile any managed present share with that
+state, including when NFS is omitted or empty, until it is corrected manually.
+For nonempty desired ACLs, apply-config validates every requested principal with exact
+category-and-name matching before any write. DSM's verified read-only inventory route is
+share-scoped, so `principal_lookup_share` should name an approved existing share from
+which the inventory can be read. If it is omitted, apply-config uses the lexicographically first configured,
+live, non-absent managed share deterministically; it never selects an unconfigured live
+share. A new share with ACL entries and no such source fails preflight with code `40`.
+The lookup performs no mutation and does not query LDAP directly from the CLI. Incomplete,
+unsupported, duplicate, or malformed DSM inventory responses fail with code `40`; a
+complete lookup missing an exact requested identity fails with code `41`. Only the implicit
+`local_group:administrators:read-write` grant is protected during ACL reconciliation.
+
+Config `host` takes precedence over `--host`, then `SYN_HOST`. Username is `--username`
+then `SYN_USERNAME`; password is `--password` then `SYN_PASSWORD`; port remains CLI/default
+`5001` and `--insecure` is CLI-only. Credentials, session data, and raw secret values are
+not rendered or logged.
+
+Without `--yes`, apply-config authenticates, reads the NAS, performs remote preflight,
+and renders a real NAS-backed `mode: dry-run` diff. It performs no writes and exits `0`,
+including no-op plans. `--yes` completes the same preflight before any write, applies
+serially without a prompt, and verifies changed families by read-back. A failed or uncertain
+mutation stops the plan without rollback and exits `60`; inspect the rendered operations,
+remediate the NAS, and re-run. Apply-config uses `10`, `20`, `30`, `40`, `41`, `50`, `60`,
+and `70` as described above; it never uses local-plan code `11`.

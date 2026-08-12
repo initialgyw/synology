@@ -1,0 +1,43 @@
+version: 1
+host: nas.example.test
+# Existing share used only for read-only DSM ACL principal inventory.
+principal_lookup_share: approved-acl-inventory
+
+# root_squash is an exact DSM v1 token. UI mapping matrix:
+#   root       => No mapping
+#   admin      => Map root to admin
+#   guest      => Map root to guest
+#   all_admin  => Map all users to admin
+#   all_guest  => Map all users to guest
+# Only these exact lowercase raw DSM tokens are accepted. Linux aliases
+# (no_root_squash, none, all_squash, and map_root) and case variants are rejected.
+# security_flavors is restricted to [sys]. admin and all_admin map access to the
+# administrator identity; all_admin and all_guest affect every user. Review non-default
+# mappings before applying.
+volumes:
+  /volume1:
+    shares:
+      - name: projects
+        description: Project files
+        quota: 200
+        acl:
+          entries:
+            - principal: alice
+              principal_type: local-user
+              permissions: read-write
+        nfs:
+          rules:
+            - client_cidr: "10.192.10.0/24"
+              access: read-write
+              root_squash: root
+              security_flavors: [sys]
+              async: false
+              insecure: false
+              crossmnt: false
+      - name: unlimited-defaults
+        acl:
+          entries: []
+        nfs:
+          rules: []
+      - name: retired-share
+        state: absent

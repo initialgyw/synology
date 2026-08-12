@@ -3,11 +3,14 @@ from collections.abc import Sequence
 
 import yaml
 
+from synology.apply_config import ApplyPlan
 from synology.exceptions import OutputError
 from synology.models import (
     AclPermissionRecord,
     EnrichmentStatus,
     NfsClientPermission,
+    NfsDisplayPermission,
+    NfsRootSquash,
     OutputFormat,
     PermissionSpec,
     ShareCreateResult,
@@ -17,6 +20,102 @@ from synology.models import (
     ShareOperationStep,
     ShareRecord,
 )
+
+
+def render_apply_plan(
+    plan: ApplyPlan, output_format: OutputFormat, *, mode: str, host: str
+) -> str:
+    """Render an apply-config plan without connection secrets."""
+    try:
+        warnings = apply_plan_warnings(plan)
+        record = {
+            "mode": mode,
+            "host": host,
+            "no_op": not plan.operations,
+            "warnings": warnings,
+            "operations": [
+                {
+                    "share": item.share,
+                    "family": item.family,
+                    "before": item.before,
+                    "after": item.after,
+                    "status": item.status.value,
+                }
+                for item in plan.operations
+            ],
+        }
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        if output_format is OutputFormat.YAML:
+            return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+        if not plan.operations:
+            return f"MODE: {mode}\nHOST: {host}\nNo changes."
+        headers = ["SHARE", "FAMILY", "BEFORE", "AFTER", "STATUS"]
+        rows = [
+            [item.share, item.family, item.before, item.after, item.status.value]
+            for item in plan.operations
+        ]
+        widths = [
+            max(len(headers[index]), *(len(row[index]) for row in rows))
+            for index in range(len(headers))
+        ]
+        return "\n".join(
+            [
+                f"MODE: {mode}",
+                f"HOST: {host}",
+                *(f"WARNING: {warning}" for warning in warnings),
+                "  ".join(
+                    header.ljust(widths[index]) for index, header in enumerate(headers)
+                ),
+                "  ".join("-" * width for width in widths),
+                *[
+                    "  ".join(
+                        value.ljust(widths[index]) for index, value in enumerate(row)
+                    )
+                    for row in rows
+                ],
+            ]
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
+
+
+_ROOT_SQUASH_WARNINGS = {
+    NfsRootSquash.ADMIN: (
+        "root_squash=admin (Map root to admin) is a privileged identity mapping; "
+        "review before applying"
+    ),
+    NfsRootSquash.GUEST: (
+        "root_squash=guest (Map root to guest) changes root-originated identity "
+        "mapping; review before applying"
+    ),
+    NfsRootSquash.ALL_ADMIN: (
+        "root_squash=all_admin (Map all users to admin) is a privileged identity "
+        "mapping; review before applying"
+    ),
+    NfsRootSquash.ALL_GUEST: (
+        "root_squash=all_guest (Map all users to guest) changes all-user identity "
+        "mapping; review before applying"
+    ),
+}
+
+
+def apply_plan_warnings(plan: ApplyPlan) -> list[str]:
+    """Return safety warnings for non-default NFS mapping operations."""
+    nfs_operation_shares = {
+        operation.share for operation in plan.operations if operation.family == "nfs"
+    }
+    root_squash_modes = {
+        rule.root_squash
+        for share in plan.config.shares
+        if share.name in nfs_operation_shares
+        for rule in share.nfs
+    }
+    return [
+        warning
+        for root_squash, warning in _ROOT_SQUASH_WARNINGS.items()
+        if root_squash in root_squash_modes
+    ]
 
 
 def render_share_create(result: ShareCreateResult, output_format: OutputFormat) -> str:
@@ -46,7 +145,7 @@ def render_share_create(result: ShareCreateResult, output_format: OutputFormat) 
                             "async": item.async_enabled,
                             "insecure": item.insecure,
                             "crossmnt": item.crossmnt,
-                            "root_squash": item.root_squash,
+                            "root_squash": item.root_squash.value,
                             "security_flavor": {
                                 "sys": item.security_flavor.sys,
                                 "kerberos": item.security_flavor.kerberos,
@@ -343,9 +442,9 @@ def _detail_record(detail: ShareDetails) -> dict[str, object]:
             "is_custom": item.is_custom,
             "is_admin": item.is_admin,
         }
-        for item in detail.acl_permissions
+        for item in _display_acl_permissions(detail.acl_permissions)
     ]
-    share["nfs_permissions"] = [_nfs_record(item) for item in detail.nfs_permissions]
+    share["nfs_permissions"] = _detail_nfs_records(detail)
     share["permission_status"] = detail.acl_status.value
     share["nfs_status"] = detail.nfs_status.value
     share["diagnostics"] = [
@@ -360,16 +459,108 @@ def _detail_record(detail: ShareDetails) -> dict[str, object]:
     return share
 
 
-def _nfs_record(item: NfsClientPermission) -> dict[str, object]:
-    permission = item
+def _detail_nfs_records(detail: ShareDetails) -> list[dict[str, object]] | None:
+    """Return display NFS records or null when the NFS read was unavailable."""
+    if detail.nfs_status is EnrichmentStatus.UNAVAILABLE:
+        return None
+    return [_nfs_record(item) for item in _display_nfs_permissions(detail)]
+
+
+def _nfs_record(
+    permission: NfsClientPermission | NfsDisplayPermission,
+) -> dict[str, object]:
     return {
         "client": permission.client,
         "access": permission.access_mode.value,
         "async": permission.async_enabled,
         "insecure": permission.insecure,
         "crossmnt": permission.crossmnt,
-        "root_squash": permission.root_squash,
+        "root_squash": permission.root_squash.value,
+        "security_flavor": {
+            "sys": permission.security_flavor.sys,
+            "kerberos": permission.security_flavor.kerberos,
+            "kerberos_integrity": permission.security_flavor.kerberos_integrity,
+            "kerberos_privacy": permission.security_flavor.kerberos_privacy,
+        },
     }
+
+
+def _display_acl_permissions(
+    permissions: Sequence[AclPermissionRecord],
+) -> list[AclPermissionRecord]:
+    return sorted(
+        (
+            permission
+            for permission in permissions
+            if not _is_protected_administrator_permission(permission)
+        ),
+        key=lambda permission: (
+            permission.category,
+            permission.name,
+            _access(permission),
+        ),
+    )
+
+
+def _is_protected_administrator_permission(permission: AclPermissionRecord) -> bool:
+    return (
+        permission.category == "local_group"
+        and permission.name == "administrators"
+        and not permission.is_deny
+        and _access(permission) == "read-write"
+    )
+
+
+def _display_nfs_permissions(
+    detail: ShareDetails,
+) -> list[NfsClientPermission | NfsDisplayPermission]:
+    permissions = (
+        detail.nfs_display_permissions
+        if detail.nfs_display_permissions
+        else detail.nfs_permissions
+    )
+    return sorted(permissions, key=_nfs_display_sort_key)
+
+
+def _nfs_display_sort_key(
+    permission: NfsClientPermission | NfsDisplayPermission,
+) -> tuple[str, str, str, str]:
+    """Sort display-only NFS rules by identity before stable rule details."""
+    formatted = _nfs_display_text(permission)
+    return (
+        permission.client,
+        permission.access_mode.value,
+        permission.root_squash.value,
+        formatted,
+    )
+
+
+def _nfs_display_text(permission: NfsClientPermission | NfsDisplayPermission) -> str:
+    return (
+        f"{permission.client}:{permission.access_mode.value},"
+        f"squash={permission.root_squash.value},"
+        f"security_flavors=[{_enabled_security_flavors(permission)}],"
+        f"async={str(permission.async_enabled).lower()},"
+        f"insecure={str(permission.insecure).lower()},"
+        f"crossmnt={str(permission.crossmnt).lower()}"
+    )
+
+
+def _enabled_security_flavors(
+    permission: NfsClientPermission | NfsDisplayPermission,
+) -> str:
+    """Return enabled DSM NFS security flavors in canonical display order."""
+    flavor = permission.security_flavor
+    return ",".join(
+        name
+        for name, enabled in (
+            ("sys", flavor.sys),
+            ("kerberos", flavor.kerberos),
+            ("kerberos_integrity", flavor.kerberos_integrity),
+            ("kerberos_privacy", flavor.kerberos_privacy),
+        )
+        if enabled
+    )
 
 
 def _render_table(shares: Sequence[ShareRecord]) -> str:
@@ -423,7 +614,7 @@ def _render_detail_table(details: Sequence[ShareDetails]) -> str:
             if detail.acl_status is EnrichmentStatus.UNAVAILABLE
             else "; ".join(
                 f"{item.category}:{item.name}:{_access(item)}"
-                for item in detail.acl_permissions
+                for item in _display_acl_permissions(detail.acl_permissions)
             )
             or "-"
         )
@@ -431,8 +622,7 @@ def _render_detail_table(details: Sequence[ShareDetails]) -> str:
             "?"
             if detail.nfs_status is EnrichmentStatus.UNAVAILABLE
             else "; ".join(
-                f"{item.client}:{item.access_mode.value}"
-                for item in detail.nfs_permissions
+                _nfs_display_text(item) for item in _display_nfs_permissions(detail)
             )
             or "-"
         )

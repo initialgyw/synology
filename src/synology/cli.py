@@ -2,8 +2,16 @@ import argparse
 import logging as stdlib_logging
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import NoReturn, Protocol, TextIO, cast
 
+from synology.apply_config import (
+    ApplyClient,
+    ApplyPlan,
+    build_apply_plan,
+    execute_apply_plan,
+    load_apply_config,
+)
 from synology.config import (
     resolve_connection_config,
     validate_nfs_permission_specs,
@@ -44,6 +52,8 @@ from synology.models import (
     ShareRecord,
 )
 from synology.output import (
+    apply_plan_warnings,
+    render_apply_plan,
     render_share_create,
     render_share_delete,
     render_share_details,
@@ -105,7 +115,43 @@ def run(
         return 0 if exc.code is None else int(exc.code)
 
     logger = configure_logging(arguments.verbose, stream=stderr)
+    selected_host = ""
     try:
+        if arguments.command is Command.APPLY_CONFIG:
+            apply_config = load_apply_config(arguments.config_path)
+            apply_arguments = replace(
+                arguments,
+                host=apply_config.host
+                if apply_config.host is not None
+                else arguments.host,
+            )
+            config = resolve_connection_config(apply_arguments, environ=environ)
+            selected_host = config.host
+            if config.insecure:
+                logger.warning("TLS certificate verification is disabled")
+            factory = (
+                _default_client_factory if client_factory is None else client_factory
+            )
+            client = factory(config, logger)
+            plan = build_apply_plan(apply_config, cast(ApplyClient, client))
+            for warning in apply_plan_warnings(plan):
+                logger.warning("%s", warning)
+            if not arguments.confirm:
+                _write_output(
+                    render_apply_plan(
+                        plan, arguments.output, mode="dry-run", host=config.host
+                    ),
+                    stdout,
+                )
+                return 0
+            result = execute_apply_plan(plan, cast(ApplyClient, client))
+            _write_output(
+                render_apply_plan(
+                    result, arguments.output, mode="apply", host=config.host
+                ),
+                stdout,
+            )
+            return 0
         if arguments.command is Command.DELETE_SHARE:
             delete_request = validate_share_delete_request(
                 ShareDeleteRequest(name=arguments.name)
@@ -271,12 +317,19 @@ def run(
         _write_error(str(exc), stderr)
         return 40
     except PartialOperationError as exc:
-        result = exc.result
+        partial_result = exc.result
         try:
-            if isinstance(result, ShareModifyResult):
-                rendered = render_share_modify(result, arguments.output)
-            elif isinstance(result, ShareCreateResult):
-                rendered = render_share_create(result, arguments.output)
+            if isinstance(partial_result, ApplyPlan):
+                rendered = render_apply_plan(
+                    partial_result,
+                    arguments.output,
+                    mode="apply",
+                    host=selected_host or "unknown",
+                )
+            elif isinstance(partial_result, ShareModifyResult):
+                rendered = render_share_modify(partial_result, arguments.output)
+            elif isinstance(partial_result, ShareCreateResult):
+                rendered = render_share_create(partial_result, arguments.output)
             else:
                 raise OutputError("unable to render partial operation output")
             _write_output(rendered, stdout)
@@ -426,7 +479,8 @@ def _build_parser() -> _CliArgumentParser:
         metavar="SPEC",
         help=(
             "Repeatable complete NFS rule, e.g. "
-            "client=10.192.10.0/24,access=read-write; global NFS must be enabled."
+            "client=10.192.10.0/24,access=read-write,root_squash=root; "
+            "global NFS must be enabled."
         ),
     )
     create_share.add_argument(
@@ -474,7 +528,11 @@ def _build_parser() -> _CliArgumentParser:
         action="append",
         default=[],
         metavar="SPEC",
-        help="Repeatable replacement NFS rule; an empty value clears all NFS rules.",
+        help=(
+            "Repeatable replacement NFS rule "
+            "(root_squash=root|admin|guest|all_admin|all_guest); "
+            "an empty value clears all NFS rules."
+        ),
     )
     modify_share.add_argument(
         "--yes",
@@ -506,6 +564,29 @@ def _build_parser() -> _CliArgumentParser:
         help="Confirm NAS mutation; without it, print a local plan and exit 11.",
     )
     delete_share.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    apply_config = subparsers.add_parser(
+        "apply-config",
+        help="Reconcile configured shares from a strict V1 YAML document.",
+        description=(
+            "Read live NAS state and render a dry-run diff; --yes applies the "
+            "preflighted plan."
+        ),
+    )
+    _add_global_options(apply_config)
+    apply_config.add_argument("config_path", help="Path to the V1 YAML configuration.")
+    apply_config.add_argument(
+        "--yes",
+        dest="confirm",
+        action="store_true",
+        help="Apply the complete preflighted plan without a prompt.",
+    )
+    apply_config.add_argument(
         "-o",
         "--output",
         choices=tuple(item.value for item in OutputFormat),
@@ -590,6 +671,8 @@ def _parse_arguments(
                 values.get("nfs_permission_specs", []), "nfs-permission"
             ),
             permissions=_boolean(values.get("permissions", False), "permissions"),
+            config_path=_optional_string(values.get("config_path"), "config path")
+            or "",
         )
     except ValueError as exc:
         raise _UsageError("invalid command-line value") from exc

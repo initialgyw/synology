@@ -15,6 +15,7 @@ from synology.exceptions import ConfigurationError
 from synology.models import (
     CliArguments,
     NfsAccessMode,
+    NfsRootSquash,
     OutputFormat,
     PermissionAccessMode,
     PermissionPrincipalType,
@@ -189,8 +190,32 @@ def test_nfs_permission_spec_parses_safe_defaults() -> None:
     assert permission.async_enabled is False
     assert permission.insecure is False
     assert permission.crossmnt is False
-    assert permission.root_squash == "root"
+    assert permission.root_squash is NfsRootSquash.ROOT
     assert permission.security_flavor.sys is True
+
+
+@pytest.mark.parametrize("root_squash", list(NfsRootSquash))
+def test_nfs_permission_spec_parses_exact_dsm_root_squash_tokens(
+    root_squash: NfsRootSquash,
+) -> None:
+    permission = parse_nfs_permission_spec(
+        "client=10.192.10.20,access=read-write,root_squash=" + root_squash.value
+    )
+
+    assert permission.root_squash is root_squash
+
+
+@pytest.mark.parametrize(
+    "root_squash",
+    ["no_root_squash", "none", "all_squash", "map_root", "ROOT", "Admin", "unknown"],
+)
+def test_nfs_permission_spec_rejects_non_dsm_root_squash_tokens(
+    root_squash: str,
+) -> None:
+    with pytest.raises(ConfigurationError, match="root_squash"):
+        parse_nfs_permission_spec(
+            "client=10.192.10.20,access=read-write,root_squash=" + root_squash
+        )
 
 
 @pytest.mark.parametrize(
@@ -201,6 +226,8 @@ def test_nfs_permission_spec_parses_safe_defaults() -> None:
         "client=10.192.10.20,access=unknown",
         "client=hostname,access=read-write",
         "client=10.192.10.20,access=read-write,async=yes",
+        "client=10.192.10.20,access=read-write,root_squash=",
+        "client=10.192.10.20,access=read-write,root_squash",
         "client=10.192.10.20,access=read-write,unknown=value",
         "client=10.192.10.20,client=10.192.10.21,access=read-write",
     ],

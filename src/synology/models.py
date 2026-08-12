@@ -16,6 +16,7 @@ class Command(StrEnum):
     CREATE_SHARE = "create-share"
     DELETE_SHARE = "delete-share"
     MODIFY_SHARE = "modify-share"
+    APPLY_CONFIG = "apply-config"
 
 
 class OperationStatus(StrEnum):
@@ -58,6 +59,14 @@ class NfsAccessMode(StrEnum):
     READ_WRITE = "read-write"
 
 
+class NfsRootSquash(StrEnum):
+    ROOT = "root"
+    ADMIN = "admin"
+    GUEST = "guest"
+    ALL_ADMIN = "all_admin"
+    ALL_GUEST = "all_guest"
+
+
 @dataclass(frozen=True, slots=True)
 class NfsSecurityFlavor:
     sys: bool = True
@@ -73,7 +82,18 @@ class NfsClientPermission:
     async_enabled: bool = False
     insecure: bool = False
     crossmnt: bool = False
-    root_squash: str = "root"
+    root_squash: NfsRootSquash = NfsRootSquash.ROOT
+    security_flavor: NfsSecurityFlavor = field(default_factory=NfsSecurityFlavor)
+
+
+@dataclass(frozen=True, slots=True)
+class NfsDisplayPermission:
+    client: str
+    access_mode: NfsAccessMode
+    async_enabled: bool = False
+    insecure: bool = False
+    crossmnt: bool = False
+    root_squash: NfsRootSquash = NfsRootSquash.ROOT
     security_flavor: NfsSecurityFlavor = field(default_factory=NfsSecurityFlavor)
 
 
@@ -82,6 +102,24 @@ class PermissionSpec:
     principal_type: PermissionPrincipalType
     principal_name: str
     access_mode: PermissionAccessMode
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalIdentity:
+    principal_type: PermissionPrincipalType
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalLookupRequest:
+    lookup_share: str
+    identities: tuple[PrincipalIdentity, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalLookupResult:
+    lookup_share: str
+    identities: tuple[PrincipalIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +166,7 @@ class CliArguments:
     permission_specs: tuple[str, ...] = ()
     nfs_permission_specs: tuple[str, ...] = ()
     permissions: bool = False
+    config_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +209,7 @@ class ShareModifyRequest:
     permissions: tuple[PermissionSpec, ...] | None = None
     nfs_permissions: tuple[NfsClientPermission, ...] | None = None
     _acl_clear_mode: bool = field(default=False, repr=False, compare=False)
+    _acl_authoritative_mode: bool = field(default=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +325,9 @@ class ShareDetails:
     acl_status: EnrichmentStatus = EnrichmentStatus.NOT_REQUESTED
     nfs_status: EnrichmentStatus = EnrichmentStatus.NOT_REQUESTED
     diagnostics: tuple[EnrichmentDiagnostic, ...] = ()
+    nfs_display_permissions: tuple[NfsClientPermission | NfsDisplayPermission, ...] = (
+        field(default=(), repr=False, compare=False)
+    )
 
 
 class OutputFormat(StrEnum):

@@ -9,6 +9,7 @@ from synology.models import (
     ConnectionConfig,
     NfsAccessMode,
     NfsClientPermission,
+    NfsRootSquash,
     NfsSecurityFlavor,
     PermissionAccessMode,
     PermissionPrincipalType,
@@ -45,7 +46,7 @@ def parse_permission_spec(specification: str) -> PermissionSpec:
 def parse_nfs_permission_spec(specification: str) -> NfsClientPermission:
     parts = specification.split(",")
     values: dict[str, str] = {}
-    allowed = {"client", "access", "async", "insecure", "crossmnt"}
+    allowed = {"client", "access", "async", "insecure", "crossmnt", "root_squash"}
     for part in parts:
         if "=" not in part:
             raise ConfigurationError(
@@ -72,12 +73,20 @@ def parse_nfs_permission_spec(specification: str) -> NfsClientPermission:
         if value not in {"true", "false"}:
             raise ConfigurationError(f"nfs {key} must be true or false")
         booleans[key] = value == "true"
+    try:
+        root_squash = NfsRootSquash(values.get("root_squash", "root"))
+    except ValueError as exc:
+        raise ConfigurationError(
+            "nfs root_squash must be one of root, admin, guest, all_admin, or "
+            "all_guest; Linux no_root_squash and none are not accepted by this DSM API"
+        ) from exc
     return NfsClientPermission(
         client=client,
         access_mode=access_mode,
         async_enabled=booleans["async"],
         insecure=booleans["insecure"],
         crossmnt=booleans["crossmnt"],
+        root_squash=root_squash,
         security_flavor=NfsSecurityFlavor(),
     )
 
@@ -156,7 +165,12 @@ def validate_share_modify_request(request: ShareModifyRequest) -> ShareModifyReq
             raise ConfigurationError("quota must be an integer GiB value")
         if request.quota_gib < 0 or request.quota_gib > MAX_QUOTA_GIB:
             raise ConfigurationError(f"quota must be between 0 and {MAX_QUOTA_GIB} GiB")
-    return replace(request, name=name)
+    nfs_permissions = (
+        None
+        if request.nfs_permissions is None
+        else _validate_nfs_permissions(request.nfs_permissions)
+    )
+    return replace(request, name=name, nfs_permissions=nfs_permissions)
 
 
 def validate_share_delete_request(request: ShareDeleteRequest) -> ShareDeleteRequest:
@@ -193,8 +207,43 @@ def validate_share_create_request(request: ShareCreateRequest) -> ShareCreateReq
         description=description,
         options=options,
         permissions=request.permissions,
-        nfs_permissions=request.nfs_permissions,
+        nfs_permissions=_validate_nfs_permissions(request.nfs_permissions),
     )
+
+
+def _validate_nfs_permissions(
+    permissions: tuple[NfsClientPermission, ...],
+) -> tuple[NfsClientPermission, ...]:
+    normalized: list[NfsClientPermission] = []
+    clients: set[tuple[int, int, int]] = set()
+    for permission in permissions:
+        if not isinstance(permission, NfsClientPermission):
+            raise ConfigurationError("invalid NFS permission")
+        if not isinstance(permission.client, str):
+            raise ConfigurationError(
+                "nfs client must be a valid IP address, CIDR, or wildcard"
+            )
+        client, identity = normalize_nfs_client(permission.client)
+        if identity in clients:
+            raise ConfigurationError("duplicate nfs clients are not allowed")
+        clients.add(identity)
+        if not isinstance(permission.access_mode, NfsAccessMode):
+            raise ConfigurationError("nfs access must be read-only or read-write")
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                permission.async_enabled,
+                permission.insecure,
+                permission.crossmnt,
+            )
+        ):
+            raise ConfigurationError("nfs flags must be boolean")
+        if not isinstance(permission.root_squash, NfsRootSquash):
+            raise ConfigurationError("invalid nfs root_squash")
+        if permission.security_flavor != NfsSecurityFlavor():
+            raise ConfigurationError("NFS security_flavor must be [sys]")
+        normalized.append(replace(permission, client=client))
+    return tuple(normalized)
 
 
 def _validate_options(options: ShareCreateOptions) -> ShareCreateOptions:
