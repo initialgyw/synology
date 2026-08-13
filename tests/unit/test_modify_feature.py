@@ -31,6 +31,7 @@ from synology.models import (
     ShareOperationStep,
     ShareQuotaState,
     ShareRecord,
+    ShareScalarUpdateRequest,
 )
 from synology.output import render_share_modify
 from synology.shares import SynShareClient
@@ -1681,6 +1682,74 @@ def _quota_state(quota_value: int) -> dict[str, object]:
         "enable_share_cow": False,
         "quota_value": quota_value,
     }
+
+
+def _external_scalar_state(description: str) -> dict[str, object]:
+    return {
+        "name": "projects",
+        "vol_path": "/volumeUSB1/usbshare",
+        "desc": description,
+        "hidden": False,
+    }
+
+
+def test_external_description_scalar_update_scopes_payload_and_verifies() -> None:
+    share = MutableQuotaShare(
+        _external_scalar_state("old"),
+        readback_state=_external_scalar_state("managed"),
+    )
+
+    _client(share=share).update_share_scalars(
+        ShareScalarUpdateRequest("projects", "managed")
+    )
+
+    assert len(share.calls) == 1
+    payload = json.loads(str(share.calls[0][2]["shareinfo"]))
+    assert payload == {
+        "name": "projects",
+        "vol_path": "/volumeUSB1/usbshare",
+        "desc": "managed",
+        "hidden": False,
+        "enable_recycle_bin": False,
+        "recycle_bin_admin_only": True,
+    }
+
+
+@pytest.mark.parametrize("quota", [0, 5 * 1024])
+def test_external_explicit_scalar_quota_fails_before_set(quota: int) -> None:
+    share = MutableQuotaShare(_external_scalar_state("old"))
+
+    with pytest.raises(ApiError, match="projects.*volumeUSB1.*quota"):
+        _client(share=share).update_share_scalars(
+            ShareScalarUpdateRequest("projects", "managed", quota)
+        )
+
+    assert share.calls == []
+
+
+def test_scalar_preflight_error_is_not_partial_operation() -> None:
+    state = _quota_state(0)
+    state["desc"] = 4
+    share = MutableQuotaShare(state)
+
+    with pytest.raises(ApiError) as error:
+        _client(share=share).update_share_scalars(
+            ShareScalarUpdateRequest("projects", "managed")
+        )
+
+    assert not isinstance(error.value, PartialOperationError)
+    assert share.calls == []
+
+
+def test_modify_quota_external_unavailable_fails_before_set() -> None:
+    share = MutableQuotaShare(_external_scalar_state("old"))
+
+    with pytest.raises(ApiError, match="projects.*volumeUSB1.*quota"):
+        _client(share=share).modify_share(
+            ShareModifyRequest(name="projects", quota_gib=0)
+        )
+
+    assert share.calls == []
 
 
 def test_modify_quota_uses_verified_raw_set_payload_and_readback() -> None:
