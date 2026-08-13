@@ -287,8 +287,9 @@ retained comments or formatting that create a serialized diff require `--yes`.
 Duplicate keys and all present V1 root/managed structures are validated before
 credentials or client construction. A valid `version: 1` root without `volumes` is the
 sole import exception, allowing import to create `volumes`; every proposal is strict
-V1-valid. Import replaces the target node with live description, quota, mutable ACLs,
-and complete supported NFS rules. It creates missing `volumes` or the live volume,
+V1-valid. Import replaces the target node with live description, available quota,
+mutable ACLs, and complete supported NFS rules; it omits `quota` when the live share does
+not expose quota capability. It creates missing `volumes` or the live volume,
 moves a target from another volume, and preserves supported root fields, volumes,
 shares, comments, and formatting where possible. The protected exact
 `local_group:administrators:read-write` ACL is omitted.
@@ -320,10 +321,14 @@ Unknown fields, duplicate YAML keys, malformed values, duplicate share names/ACL
 identities/normalized NFS clients are rejected. `state` defaults to `present`;
 `state: absent` permits only `name` and `state`.
 
-`quota` is an in-range GiB integer. Omitted quota means unlimited (`0 MiB`) and clears a
-finite quota. Omitted descriptions preserve an existing description or use empty for a
-new share; explicit empty clears it. Omitted ACLs and `entries: []` clear mutable ACLs
-while preserving `local_group:administrators:read-write`. Omitted NFS and `rules: []`
+`quota` is an in-range GiB integer. On canonical internal `/volumeN` shares, omitted
+quota means unlimited (`0 MiB`) and clears a finite quota. Some noncanonical/external
+volumes do not expose quota, compression, or COW capabilities: omitted quota preserves
+that unavailable quota, while an explicit quota is rejected before any write. Their
+description, ACL, and NFS rules remain managed. Omitted descriptions preserve an existing
+description or use empty for a new share; explicit empty clears it. Omitted ACLs and
+`entries: []` clear mutable ACLs while preserving
+`local_group:administrators:read-write`. Omitted NFS and `rules: []`
 clear all NFS rules.
 
 NFS V1 accepts only tokens in [NFS squash mappings](#nfs-squash-mappings) and

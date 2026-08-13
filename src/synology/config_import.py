@@ -179,14 +179,15 @@ def _imported_share(details: ShareDetails, target: str) -> ApplyShare:
     if details.nfs_status is EnrichmentStatus.UNAVAILABLE:
         raise ApiError("incomplete target NFS response")
     quota = details.share.quota_api_value
-    if isinstance(quota, bool) or not isinstance(quota, int) or quota < 0:
-        raise ApiError("invalid target share quota")
-    if quota > MAX_QUOTA_API_MIB:
-        raise ApiError("target share quota exceeds the supported API range")
-    if quota % QUOTA_MIB_PER_GIB:
-        raise ApiError("target share quota is not representable as integer GiB")
-    if quota // QUOTA_MIB_PER_GIB > MAX_QUOTA_GIB:
-        raise ApiError("target share quota exceeds the supported GiB range")
+    if quota is not None:
+        if isinstance(quota, bool) or not isinstance(quota, int) or quota < 0:
+            raise ApiError("invalid target share quota")
+        if quota > MAX_QUOTA_API_MIB:
+            raise ApiError("target share quota exceeds the supported API range")
+        if quota % QUOTA_MIB_PER_GIB:
+            raise ApiError("target share quota is not representable as integer GiB")
+        if quota // QUOTA_MIB_PER_GIB > MAX_QUOTA_GIB:
+            raise ApiError("target share quota exceeds the supported GiB range")
     acl = tuple(sorted(_mutable_acl(details.acl_permissions), key=_acl_key))
     nfs_items = tuple(_import_nfs(item) for item in details.nfs_permissions)
     identities = [normalize_nfs_client(item.client)[1] for item in nfs_items]
@@ -306,7 +307,8 @@ def _share_node(share: ApplyShare) -> object:
     node["name"] = share.name
     node["state"] = "present"
     node["description"] = share.description
-    node["quota"] = share.quota_mib // QUOTA_MIB_PER_GIB
+    if share.quota_mib is not None:
+        node["quota"] = share.quota_mib // QUOTA_MIB_PER_GIB
     acl = _commented_map()
     entries = _commented_seq()
     for item in share.acl:

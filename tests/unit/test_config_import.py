@@ -34,6 +34,32 @@ from synology.models import (
 from synology.output import render_config_import
 
 
+def test_external_import_omits_unavailable_quota_and_stays_v1_valid() -> None:
+    details = ShareDetails(
+        ShareRecord(
+            "backups", "/volumeUSB1/usbshare", "backup", quota_api_value=None
+        ),
+        acl_status=EnrichmentStatus.EMPTY,
+        nfs_status=EnrichmentStatus.EMPTY,
+    )
+
+    imported = config_import._imported_share(details, "backups")
+    node = config_import._share_node(imported)
+    root = config_import._commented_map()
+    root["version"] = 1
+    volumes = config_import._commented_map()
+    volume = config_import._commented_map()
+    shares = config_import._commented_seq()
+    shares.append(node)
+    volume["shares"] = shares
+    volumes["/volumeUSB1/usbshare"] = volume
+    root["volumes"] = volumes
+    rendered = config_import._dump(root)
+
+    assert "quota" not in node
+    assert config_import.parse_apply_config(rendered).shares[0].quota_mib is None
+
+
 class ReadOnlyClient:
     def __init__(
         self, details: ShareDetails, shares: tuple[ShareRecord, ...] | None = None

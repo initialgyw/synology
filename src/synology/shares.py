@@ -1,7 +1,7 @@
 import json
 import logging as stdlib_logging
 from collections.abc import Mapping, Sequence
-from typing import NoReturn, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 
 from requests.exceptions import RequestException
 from synology_api.exceptions import (
@@ -26,6 +26,7 @@ from synology.exceptions import (
     ConfigurationError,
     PartialOperationError,
     PrincipalNotFoundError,
+    ScalarUpdatePreflightError,
     TransportError,
 )
 from synology.logging import sanitize
@@ -51,6 +52,7 @@ from synology.models import (
     PrincipalIdentity,
     PrincipalLookupRequest,
     PrincipalLookupResult,
+    ShareCapabilities,
     ShareCreateRequest,
     ShareCreateResult,
     ShareDeleteRequest,
@@ -60,9 +62,10 @@ from synology.models import (
     ShareModifyRequest,
     ShareModifyResult,
     ShareOperationStep,
-    ShareQuotaSetPayload,
     ShareQuotaState,
     ShareRecord,
+    ShareScalarUpdatePayload,
+    ShareScalarUpdateRequest,
 )
 
 SHARE_OPERATION = "SYNO.Core.Share.list"
@@ -237,8 +240,11 @@ class SynShareClient:
             "desc": request.description,
             "enable_recycle_bin": request.options.recycle_bin.enabled,
             "recycle_bin_admin_only": request.options.recycle_bin.admin_only,
-            "enable_share_compress": request.options.compression_enabled,
         }
+        if request.options.scalar_options_available:
+            create_arguments["enable_share_compress"] = (
+                request.options.compression_enabled
+            )
         if request.options.quota_api_value is not None:
             create_arguments["share_quota"] = request.options.quota_api_value
         try:
@@ -342,6 +348,11 @@ class SynShareClient:
             current = _read_mutable_share_state(api, request.name)
         except Exception as exc:
             self._raise_mapped_error(exc, phase="quota-preflight")
+        if current.quota is None:
+            raise ApiError(
+                f"share {request.name} on {current.volume_path} "
+                "does not support quota management"
+            )
         desired_api_value = request.quota_gib * QUOTA_MIB_PER_GIB
         if current.quota.api_value == desired_api_value:
             return ShareModifyResult(
@@ -357,7 +368,13 @@ class SynShareClient:
                     ),
                 ),
             )
-        payload = _quota_set_payload(current, version, desired_api_value)
+        payload = _scalar_update_payload(
+            current,
+            version,
+            ShareScalarUpdateRequest(
+                request.name, current.description, desired_api_value
+            ),
+        )
         try:
             response = api.request_data(
                 SHARE_SET_API,
@@ -401,8 +418,10 @@ class SynShareClient:
                 steps,
                 "quota verification did not complete",
             )
-        if observed.quota.api_value != desired_api_value or not _share_state_preserved(
-            current, observed
+        if (
+            observed.quota is None
+            or observed.quota.api_value != desired_api_value
+            or not _share_state_preserved(current, observed)
         ):
             steps.append(
                 ShareOperationStep(
@@ -720,8 +739,8 @@ class SynShareClient:
                 name=state.name,
                 volume=state.volume_path,
                 description=state.description,
-                quota_gib=state.quota.gib,
-                quota_api_value=state.quota.api_value,
+                quota_gib=None if state.quota is None else state.quota.gib,
+                quota_api_value=None if state.quota is None else state.quota.api_value,
             ),
             acl_permissions=tuple(
                 AclPermissionRecord(
@@ -806,25 +825,45 @@ class SynShareClient:
         except Exception as exc:
             self._raise_mapped_error(exc, phase="apply-create-preflight")
 
-    def update_complete_share(
-        self, name: str, description: str, quota_mib: int
-    ) -> None:
+    def update_share_scalars(self, request: ShareScalarUpdateRequest) -> None:
+        """Apply a capability-aware description and optional quota update.
+
+        All reads and payload validation occur before the set request. Once the set
+        request begins, every failure is reported as a potentially partial outcome.
+        """
         api = cast(ShareQuotaRawApi, self._share)
         try:
             version = _share_set_version(api)
-            current = _read_mutable_share_state(api, name)
+            current = _read_mutable_share_state(api, request.name)
+            if request.quota_api_value is not None and current.quota is None:
+                raise ApiError(
+                    f"share {request.name} on {current.volume_path} "
+                    "does not support quota management"
+                )
             desired = MutableShareState(
                 current.name,
                 current.volume_path,
-                description,
+                request.description,
                 current.hidden,
                 current.recycle_bin_enabled,
                 current.recycle_bin_admin_only,
                 current.compression_enabled,
                 current.cow_enabled,
-                ShareQuotaState(quota_mib),
+                (
+                    current.quota
+                    if request.quota_api_value is None
+                    else ShareQuotaState(request.quota_api_value)
+                ),
+                current.capabilities,
             )
-            payload = _quota_set_payload(desired, version, quota_mib)
+            payload = _scalar_update_payload(desired, version, request)
+        except Exception as exc:
+            try:
+                self._raise_mapped_error(exc, phase="apply-scalar-preflight")
+            except ApiError as mapped:
+                raise ScalarUpdatePreflightError(str(mapped)) from mapped
+
+        try:
             response = api.request_data(
                 SHARE_SET_API,
                 cast(str, api.core_list[SHARE_SET_API]["path"]),
@@ -837,24 +876,24 @@ class SynShareClient:
                 method="post",
             )
             if (
-                _as_mapping(response, "invalid share update response").get("success")
+                _as_mapping(
+                    response, "invalid share scalar update response"
+                ).get("success")
                 is not True
             ):
-                raise ApiError("NAS API returned an unsuccessful share update response")
-            observed = _read_mutable_share_state(api, name)
-            if (
-                observed.description != description
-                or observed.quota.api_value != quota_mib
-                or not _share_state_preserved(desired, observed)
-            ):
+                raise ApiError(
+                    "NAS API returned an unsuccessful share scalar update response"
+                )
+            observed = _read_mutable_share_state(api, request.name)
+            if not _scalar_update_verified(desired, observed, request):
                 raise PartialOperationError(
-                    "complete share update verification failed", None
+                    "share scalar update verification failed", None
                 )
         except PartialOperationError:
             raise
         except Exception as exc:
             raise PartialOperationError(
-                "complete share update outcome is uncertain", None
+                "share scalar update outcome is uncertain", None
             ) from exc
 
     def replace_apply_acl(
@@ -1128,9 +1167,15 @@ def _mutable_share_state(
     volume_path = _required_string(data, "vol_path")
     description = _required_string(data, "desc")
     hidden = _required_boolean(data, "hidden")
-    compression_enabled = _required_boolean(data, "enable_share_compress")
-    cow_enabled = _required_boolean(data, "enable_share_cow")
-    quota = ShareQuotaState(_read_quota_value(data))
+    canonical = _canonical_volume(volume_path)
+    compression_enabled = _capability_boolean(
+        data, "enable_share_compress", name, volume_path, canonical
+    )
+    cow_enabled = _capability_boolean(
+        data, "enable_share_cow", name, volume_path, canonical
+    )
+    quota_value = _capability_quota(data, name, volume_path, canonical)
+    quota = ShareQuotaState(quota_value) if quota_value is not None else None
     recycle_bin_enabled, recycle_bin_admin_only = recycle_bin
     return MutableShareState(
         name=name,
@@ -1142,6 +1187,11 @@ def _mutable_share_state(
         compression_enabled=compression_enabled,
         cow_enabled=cow_enabled,
         quota=quota,
+        capabilities=ShareCapabilities(
+            quota_available=quota is not None,
+            compression_available=compression_enabled is not None,
+            cow_available=cow_enabled is not None,
+        ),
     )
 
 
@@ -1184,10 +1234,35 @@ def _listed_recycle_bin_options(api: ShareQuotaRawApi, name: str) -> tuple[bool,
     raise ApiError("share was not found in recycle-bin response")
 
 
-def _read_quota_value(data: Mapping[str, object]) -> int:
-    value = data.get("quota_value", data.get("share_quota"))
+def _canonical_volume(volume_path: str) -> bool:
+    suffix = volume_path.removeprefix("/volume")
+    return volume_path.startswith("/volume") and suffix.isdigit() and int(suffix) > 0
+
+
+def _capability_boolean(
+    data: Mapping[str, object], field: str, name: str, volume_path: str, canonical: bool
+) -> bool | None:
+    if field not in data:
+        if canonical:
+            raise ApiError(f"share {name} on {volume_path} has unavailable {field}")
+        return None
+    value = data[field]
+    if not isinstance(value, bool):
+        raise ApiError(f"share {name} on {volume_path} has invalid {field}")
+    return value
+
+
+def _capability_quota(
+    data: Mapping[str, object], name: str, volume_path: str, canonical: bool
+) -> int | None:
+    field = "quota_value" if "quota_value" in data else "share_quota"
+    if field not in data:
+        if canonical:
+            raise ApiError(f"share {name} on {volume_path} has unavailable quota")
+        return None
+    value = data[field]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ApiError("invalid share quota state")
+        raise ApiError(f"share {name} on {volume_path} has invalid quota")
     return value
 
 
@@ -1205,24 +1280,47 @@ def _required_boolean(data: Mapping[str, object], field: str) -> bool:
     return value
 
 
-def _quota_set_payload(
-    state: MutableShareState, version: int, quota_api_value: int
-) -> ShareQuotaSetPayload:
-    shareinfo = {
+def _scalar_update_payload(
+    state: MutableShareState, version: int, request: ShareScalarUpdateRequest
+) -> ShareScalarUpdatePayload:
+    """Build a set payload using only values DSM reported as available."""
+    shareinfo: dict[str, object] = {
         "name": state.name,
         "vol_path": state.volume_path,
         "desc": state.description,
         "hidden": state.hidden,
         "enable_recycle_bin": state.recycle_bin_enabled,
         "recycle_bin_admin_only": state.recycle_bin_admin_only,
-        "enable_share_compress": state.compression_enabled,
-        "enable_share_cow": state.cow_enabled,
-        "share_quota": quota_api_value,
     }
-    return ShareQuotaSetPayload(
+    if state.capabilities.compression_available:
+        assert state.compression_enabled is not None
+        shareinfo["enable_share_compress"] = state.compression_enabled
+    if state.capabilities.cow_available:
+        assert state.cow_enabled is not None
+        shareinfo["enable_share_cow"] = state.cow_enabled
+    if request.quota_api_value is not None:
+        if not state.capabilities.quota_available:
+            raise ApiError(f"share {state.name} does not support quota management")
+        shareinfo["share_quota"] = request.quota_api_value
+    return ShareScalarUpdatePayload(
         name=state.name,
         version=version,
         shareinfo=json.dumps(shareinfo, separators=(",", ":")),
+    )
+
+
+def _scalar_update_verified(
+    desired: MutableShareState,
+    observed: MutableShareState,
+    request: ShareScalarUpdateRequest,
+) -> bool:
+    if not _share_state_preserved(desired, observed):
+        return False
+    if request.quota_api_value is None:
+        return desired.quota == observed.quota
+    return (
+        observed.quota is not None
+        and observed.quota.api_value == request.quota_api_value
     )
 
 
@@ -1238,6 +1336,7 @@ def _share_state_preserved(
         and current.recycle_bin_admin_only == observed.recycle_bin_admin_only
         and current.compression_enabled == observed.compression_enabled
         and current.cow_enabled == observed.cow_enabled
+        and current.capabilities == observed.capabilities
     )
 
 
@@ -1272,25 +1371,18 @@ def _call_create_folder(
     description = cast(str, arguments["desc"])
     enable_recycle_bin = cast(bool, arguments["enable_recycle_bin"])
     recycle_bin_admin_only = cast(bool, arguments["recycle_bin_admin_only"])
-    compression_enabled = cast(bool, arguments["enable_share_compress"])
+    kwargs: dict[str, object] = {
+        "name": name,
+        "vol_path": volume_path,
+        "desc": description,
+        "enable_recycle_bin": enable_recycle_bin,
+        "recycle_bin_admin_only": recycle_bin_admin_only,
+    }
+    if "enable_share_compress" in arguments:
+        kwargs["enable_share_compress"] = cast(bool, arguments["enable_share_compress"])
     if "share_quota" in arguments:
-        return share.create_folder(
-            name=name,
-            vol_path=volume_path,
-            desc=description,
-            enable_recycle_bin=enable_recycle_bin,
-            recycle_bin_admin_only=recycle_bin_admin_only,
-            enable_share_compress=compression_enabled,
-            share_quota=cast(int, arguments["share_quota"]),
-        )
-    return share.create_folder(
-        name=name,
-        vol_path=volume_path,
-        desc=description,
-        enable_recycle_bin=enable_recycle_bin,
-        recycle_bin_admin_only=recycle_bin_admin_only,
-        enable_share_compress=compression_enabled,
-    )
+        kwargs["share_quota"] = cast(int, arguments["share_quota"])
+    return share.create_folder(**cast(Any, kwargs))
 
 
 class _SharePermissionAdapter:

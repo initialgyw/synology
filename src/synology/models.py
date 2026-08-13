@@ -135,6 +135,7 @@ class ShareCreateOptions:
     compression_enabled: bool = False
     quota_gib: int | None = None
     quota_api_value: int | None = None
+    scalar_options_available: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +229,13 @@ class ShareQuotaState:
 
 
 @dataclass(frozen=True, slots=True)
+class ShareCapabilities:
+    quota_available: bool
+    compression_available: bool
+    cow_available: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MutableShareState:
     name: str
     volume_path: str
@@ -235,13 +243,23 @@ class MutableShareState:
     hidden: bool
     recycle_bin_enabled: bool
     recycle_bin_admin_only: bool
-    compression_enabled: bool
-    cow_enabled: bool
-    quota: ShareQuotaState
+    compression_enabled: bool | None
+    cow_enabled: bool | None
+    quota: ShareQuotaState | None
+    capabilities: ShareCapabilities
 
 
 @dataclass(frozen=True, slots=True)
-class ShareQuotaSetPayload:
+class ShareScalarUpdateRequest:
+    """Requested managed share scalar changes after apply-config preflight."""
+
+    name: str
+    description: str
+    quota_api_value: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ShareScalarUpdatePayload:
     name: str
     version: int
     shareinfo: str

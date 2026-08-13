@@ -32,12 +32,15 @@ from synology.models import (
     ShareCreateRequest,
     ShareDeleteRequest,
     ShareOperationStep,
+    ShareScalarUpdateRequest,
 )
 from synology.output import render_share_details
 from synology.shares import (
     SynShareClient,
+    _mutable_share_state,
     _nfs_rule,
     _normalize_nfs_rule,
+    _scalar_update_payload,
     _SharePermissionAdapter,
 )
 
@@ -259,6 +262,68 @@ def _nfs_load_response(permission: NfsClientPermission) -> dict[str, object]:
             ],
         },
     }
+
+
+def test_external_missing_scalar_fields_are_capabilities_not_malformed() -> None:
+    state = _mutable_share_state(
+        {
+            "name": "backups",
+            "vol_path": "/volumeUSB1/usbshare",
+            "desc": "backup",
+            "hidden": False,
+        },
+        (False, True),
+    )
+
+    assert state.quota is None
+    assert not state.capabilities.quota_available
+    assert not state.capabilities.compression_available
+    payload = json.loads(
+        _scalar_update_payload(
+            state, 1, ShareScalarUpdateRequest("backups", "backup")
+        ).shareinfo
+    )
+    assert "share_quota" not in payload
+    assert "enable_share_compress" not in payload
+    assert "enable_share_cow" not in payload
+
+
+@pytest.mark.parametrize(
+    "field", ["quota_value", "enable_share_compress", "enable_share_cow"]
+)
+def test_internal_missing_scalar_fields_fail_closed(field: str) -> None:
+    data: dict[str, object] = {
+        "name": "projects",
+        "vol_path": "/volume1",
+        "desc": "projects",
+        "hidden": False,
+        "quota_value": 0,
+        "enable_share_compress": False,
+        "enable_share_cow": False,
+    }
+    del data[field]
+
+    with pytest.raises(ApiError, match="projects.*volume1"):
+        _mutable_share_state(data, (False, True))
+
+
+@pytest.mark.parametrize(
+    "field", ["quota_value", "enable_share_compress", "enable_share_cow"]
+)
+def test_present_external_malformed_scalar_fields_fail_closed(field: str) -> None:
+    data: dict[str, object] = {
+        "name": "backups",
+        "vol_path": "/volumeUSB1/usbshare",
+        "desc": "backup",
+        "hidden": False,
+        "quota_value": 0,
+        "enable_share_compress": False,
+        "enable_share_cow": False,
+    }
+    data[field] = "invalid"
+
+    with pytest.raises(ApiError, match="backups.*volumeUSB1"):
+        _mutable_share_state(data, (False, True))
 
 
 def test_permission_adapter_quotes_share_and_principal_type() -> None:
@@ -587,6 +652,24 @@ def test_create_share_forwards_quota_when_requested() -> None:
             "share_quota": 102400,
         }
     ]
+
+
+def test_create_external_share_omits_unavailable_scalar_options() -> None:
+    share = FakeShare(
+        create_response={"success": True, "data": {"name": "backups"}}
+    )
+    client = SynShareClient(_config(), _logger(), factory=FakeFactory(share))
+
+    client.create_share(
+        ShareCreateRequest(
+            name="backups",
+            volume_path="/volumeUSB1/usbshare",
+            options=ShareCreateOptions(scalar_options_available=False),
+        )
+    )
+
+    assert "share_quota" not in share.create_calls[0]
+    assert "enable_share_compress" not in share.create_calls[0]
 
 
 def test_create_share_omits_quota_when_not_requested() -> None:

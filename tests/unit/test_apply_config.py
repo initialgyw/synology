@@ -1,3 +1,4 @@
+from dataclasses import replace
 from io import StringIO
 from typing import cast
 
@@ -15,6 +16,7 @@ from synology.exceptions import (
     ConfigurationError,
     OutputError,
     PartialOperationError,
+    ScalarUpdatePreflightError,
     TransportError,
 )
 from synology.models import (
@@ -63,8 +65,8 @@ class RecordingClient:
     def delete_share(self, request):
         self.calls.append(f"delete:{request.name}")
 
-    def update_complete_share(self, name, description, quota_mib):
-        self.calls.append(f"scalar:{name}")
+    def update_share_scalars(self, request):
+        self.calls.append(f"scalar:{request.name}")
 
     def replace_apply_acl(self, name, permissions):
         self.calls.append(f"acl:{name}")
@@ -660,6 +662,137 @@ def test_apply_config_invalid_live_nfs_client_fails_closed_before_writes(tmp_pat
         call.split(":")[0] in {"create", "scalar", "acl", "nfs", "delete"}
         for call in client.calls
     )
+
+
+def test_external_unavailable_quota_preserves_scalars_and_reconciles_acl(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n        description: managed\n",
+    )
+    mutable = AclPermissionRecord(
+        "alice", "local_user", False, True, False, False, False
+    )
+    client = RecordingClient(
+        (ShareRecord("backups", "/volumeUSB1/usbshare"),),
+        {
+            "backups": _details(
+                "backups",
+                volume="/volumeUSB1/usbshare",
+                quota=None,
+                description="old",
+                acl=(mutable,),
+            )
+        },
+    )
+
+    plan = build_apply_plan(config, client)
+
+    assert [item.family for item in plan.operations] == ["scalars", "acl"]
+    assert plan.operations[0].after == "managed | unavailable"
+
+
+def test_external_description_update_executes_after_global_preflight(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n        description: managed\n",
+    )
+
+    class UpdatingClient(RecordingClient):
+        def update_share_scalars(self, request):
+            super().update_share_scalars(request)
+            details = self.details[request.name]
+            self.details[request.name] = replace(
+                details,
+                share=replace(details.share, description=request.description),
+            )
+
+    client = UpdatingClient(
+        (ShareRecord("backups", "/volumeUSB1/usbshare"),),
+        {
+            "backups": _details(
+                "backups",
+                volume="/volumeUSB1/usbshare",
+                quota=None,
+                description="old",
+            )
+        },
+    )
+    plan = build_apply_plan(config, client)
+
+    execute_apply_plan(plan, client)
+
+    assert client.calls == ["list", "read:backups", "scalar:backups", "read:backups"]
+
+
+def test_scalar_preflight_error_does_not_become_partial_apply_result(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n        description: managed\n",
+    )
+
+    class FailingClient(RecordingClient):
+        def update_share_scalars(self, request):
+            super().update_share_scalars(request)
+            raise ScalarUpdatePreflightError(
+                "scalar capability changed during preflight"
+            )
+
+    client = FailingClient(
+        (ShareRecord("backups", "/volumeUSB1/usbshare"),),
+        {
+            "backups": _details(
+                "backups",
+                volume="/volumeUSB1/usbshare",
+                quota=None,
+                description="old",
+            )
+        },
+    )
+
+    with pytest.raises(ScalarUpdatePreflightError):
+        execute_apply_plan(build_apply_plan(config, client), client)
+
+    assert client.calls == ["list", "read:backups", "scalar:backups"]
+
+
+def test_external_explicit_quota_fails_before_all_writes(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n        quota: 0\n",
+    )
+    client = RecordingClient(
+        (ShareRecord("backups", "/volumeUSB1/usbshare"),),
+        {
+            "backups": _details(
+                "backups", volume="/volumeUSB1/usbshare", quota=None
+            )
+        },
+    )
+
+    with pytest.raises(ApiError, match="backups.*volumeUSB1.*quota"):
+        build_apply_plan(config, client)
+
+    assert not any(
+        call.split(":")[0] in {"create", "scalar", "acl", "nfs", "delete"}
+        for call in client.calls
+    )
+
+
+def test_new_external_omitted_quota_omits_scalar_create_options(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n",
+    )
+    client = RecordingClient()
+
+    plan = build_apply_plan(config, client)
+
+    assert [item.family for item in plan.operations] == ["create", "acl", "nfs"]
 
 
 def test_root_squash_only_drift_plans_replacement_and_readback_is_partial(tmp_path):

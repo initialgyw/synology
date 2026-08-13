@@ -13,7 +13,12 @@ from synology.config import (
     normalize_nfs_client,
     validate_share_create_request,
 )
-from synology.exceptions import ApiError, ConfigurationError, PartialOperationError
+from synology.exceptions import (
+    ApiError,
+    ConfigurationError,
+    PartialOperationError,
+    ScalarUpdatePreflightError,
+)
 from synology.models import (
     AclPermissionRecord,
     NfsAccessMode,
@@ -30,6 +35,7 @@ from synology.models import (
     ShareDeleteRequest,
     ShareDetails,
     ShareRecord,
+    ShareScalarUpdateRequest,
 )
 
 _MISSING = object()
@@ -41,7 +47,7 @@ class ApplyShare:
     volume: str
     state: str
     description: str | object
-    quota_mib: int
+    quota_mib: int | None
     acl: tuple[PermissionSpec, ...]
     nfs: tuple[NfsClientPermission, ...]
 
@@ -84,9 +90,7 @@ class ApplyClient(Protocol):
 
     def delete_share(self, request: ShareDeleteRequest) -> object: ...
 
-    def update_complete_share(
-        self, name: str, description: str, quota_mib: int
-    ) -> object: ...
+    def update_share_scalars(self, request: ShareScalarUpdateRequest) -> object: ...
 
     def replace_apply_acl(
         self, name: str, permissions: tuple[PermissionSpec, ...]
@@ -179,6 +183,7 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
         if desired.state == "absent":
             continue
         if listed is None:
+            _validate_desired_quota_capability(desired, None)
             new_shares.append(desired)
             effective_descriptions[desired.name] = (
                 ""
@@ -190,6 +195,7 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
             raise ApiError(f"share {desired.name} exists on a different volume")
         details = client.read_apply_details(desired.name)
         _validate_details(details, desired.name)
+        _validate_desired_quota_capability(desired, details.share)
         existing[desired.name] = details
         effective_descriptions[desired.name] = (
             cast(str, details.share.description)
@@ -277,6 +283,8 @@ def execute_apply_plan(plan: ApplyPlan, client: ApplyClient) -> ApplyPlan:
     for operation in plan.operations:
         try:
             _execute_operation(operation, plan, client)
+        except ScalarUpdatePreflightError:
+            raise
         except Exception as exc:
             failed = ApplyOperation(
                 operation.share,
@@ -331,7 +339,14 @@ def _execute_operation(
                     desired.name,
                     desired.volume,
                     description,
-                    ShareCreateOptions(quota_api_value=desired.quota_mib),
+                    ShareCreateOptions(
+                        quota_api_value=(
+                            desired.quota_mib
+                            if desired.quota_mib is not None
+                            else (0 if _canonical_volume(desired.volume) else None)
+                        ),
+                        scalar_options_available=_canonical_volume(desired.volume),
+                    ),
                 )
             )
         )
@@ -340,30 +355,53 @@ def _execute_operation(
             raise PartialOperationError(
                 "created share identity verification failed", None
             )
+        expected_quota = (
+            desired.quota_mib
+            if desired.quota_mib is not None
+            else (0 if _canonical_volume(desired.volume) else None)
+        )
         if (
             observed.description != description
-            or (observed.quota_api_value or 0) != desired.quota_mib
+            or (
+                expected_quota is not None
+                and observed.quota_api_value != expected_quota
+            )
         ):
-            client.update_complete_share(desired.name, description, desired.quota_mib)
+            client.update_share_scalars(
+                ShareScalarUpdateRequest(
+                    desired.name, description, expected_quota
+                )
+            )
             verified = client.read_apply_details(desired.name).share
             if (
                 verified.name != desired.name
                 or verified.volume != desired.volume
                 or verified.description != description
-                or (verified.quota_api_value or 0) != desired.quota_mib
+                or (
+                    expected_quota is not None
+                    and verified.quota_api_value != expected_quota
+                )
             ):
                 raise PartialOperationError("created share verification failed", None)
 
     elif operation.family == "scalars":
-        client.update_complete_share(
-            desired.name, effective_description, desired.quota_mib
+        quota_mib = (
+            desired.quota_mib
+            if desired.quota_mib is not None
+            else (0 if _canonical_volume(desired.volume) else None)
+        )
+        client.update_share_scalars(
+            ShareScalarUpdateRequest(desired.name, effective_description, quota_mib)
         )
         verified = client.read_apply_details(desired.name).share
         if (
             verified.name != desired.name
             or verified.volume != desired.volume
             or verified.description != effective_description
-            or (verified.quota_api_value or 0) != desired.quota_mib
+            or (
+                desired.quota_mib is not None
+                and verified.quota_api_value != desired.quota_mib
+            )
         ):
             raise PartialOperationError("share scalar read-back did not match", None)
     elif operation.family == "acl":
@@ -400,15 +438,20 @@ def _existing_operations(
     share = details.share
     operations: list[ApplyOperation] = []
     description = share.description or ""
-    raw_quota = share.quota_api_value or 0
+    raw_quota = share.quota_api_value
+    desired_quota = (
+        0 if desired.quota_mib is None and raw_quota is not None else desired.quota_mib
+    )
     wanted_description = effective_description
-    if description != wanted_description or raw_quota != desired.quota_mib:
+    if description != wanted_description or (
+        desired_quota is not None and raw_quota != desired_quota
+    ):
         operations.append(
             ApplyOperation(
                 desired.name,
                 "scalars",
                 f"{description} | {_quota_text(raw_quota)}",
-                f"{wanted_description} | {_quota_text(desired.quota_mib)}",
+                f"{wanted_description} | {_quota_text(desired_quota)}",
             )
         )
     actual_acl = _mutable_live_acl(details.acl_permissions)
@@ -484,7 +527,7 @@ def _share(data: Mapping[str, object], volume: str) -> ApplyShare:
     description = _optional_text(data.get("description", _MISSING), "description")
     quota = data.get("quota", _MISSING)
     if quota is _MISSING:
-        quota_mib = 0
+        quota_mib = None
     elif (
         isinstance(quota, bool)
         or not isinstance(quota, int)
@@ -756,7 +799,28 @@ def _nfs_set(values: tuple[NfsClientPermission, ...]) -> set[tuple[object, ...]]
     }
 
 
-def _quota_text(value: int) -> str:
+def _validate_desired_quota_capability(
+    desired: ApplyShare, observed: ShareRecord | None
+) -> None:
+    unavailable = (
+        not _canonical_volume(desired.volume)
+        if observed is None
+        else observed.quota_api_value is None
+    )
+    if unavailable and desired.quota_mib is not None:
+        raise ApiError(
+            f"share {desired.name} on {desired.volume} "
+            "does not support quota management"
+        )
+
+
+def _canonical_volume(volume: str) -> bool:
+    return volume.startswith("/volume") and volume[7:].isdigit() and int(volume[7:]) > 0
+
+
+def _quota_text(value: int | None) -> str:
+    if value is None:
+        return "unavailable"
     return "unlimited (0 MiB)" if value == 0 else f"{value} MiB"
 
 

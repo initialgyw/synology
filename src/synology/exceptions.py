@@ -24,6 +24,10 @@ class ApiError(SynologyCliError):
     pass
 
 
+class ScalarUpdatePreflightError(ApiError):
+    """A capability-aware scalar update failed before its set request began."""
+
+
 class PrincipalNotFoundError(SynologyCliError):
     def __init__(self, missing: tuple["AclPrincipal", ...]) -> None:
         self.missing = missing
