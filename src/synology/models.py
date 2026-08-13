@@ -18,6 +18,9 @@ class Command(StrEnum):
     MODIFY_SHARE = "modify-share"
     APPLY_CONFIG = "apply-config"
     CONFIG_IMPORT = "config-import"
+    ADD_DIR = "add-dir"
+    LIST_DIRS = "list-dirs"
+    RM_DIR = "rm-dir"
 
 
 class OperationStatus(StrEnum):
@@ -157,6 +160,8 @@ class CliArguments:
     output: "OutputFormat"
     command: Command = Command.LIST_SHARES
     name: str = ""
+    share: str = ""
+    directory: str = ""
     volume_path: str = ""
     description: str = ""
     confirm: bool = False
@@ -202,6 +207,84 @@ class ShareCreateResult:
 @dataclass(frozen=True, slots=True)
 class ShareDeleteRequest:
     name: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubshareCreateRequest:
+    share: str
+    directory: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubshareCreateResult:
+    share: str
+    directory: str
+    path: str | None
+    created: bool
+    steps: tuple[ShareOperationStep, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SubsharePreflightResult:
+    share: str
+    directory: str
+    path: str
+    virtual_parent: str
+    steps: tuple[ShareOperationStep, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ListDirsRequest:
+    share: str
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryRecord:
+    name: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyDirectoryPreflight:
+    share: str
+    directory: str
+    path: str
+    virtual_path: str | None
+    target_kind: str
+    empty: bool | None
+    future: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ListDirsResult:
+    share: str
+    directories: tuple[DirectoryRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SubshareDeleteRequest:
+    share: str
+    directory: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubshareDeletePreflightResult:
+    share: str
+    directory: str
+    path: str
+    virtual_path: str
+    steps: tuple[ShareOperationStep, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SubshareDeleteResult:
+    share: str
+    directory: str
+    path: str | None
+    virtual_path: str | None
+    deleted: bool
+    status: str
+    steps: tuple[ShareOperationStep, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

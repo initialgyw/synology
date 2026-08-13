@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import replace
 
@@ -19,6 +20,7 @@ from synology.models import (
     ShareCreateRequest,
     ShareDeleteRequest,
     ShareModifyRequest,
+    SubshareCreateRequest,
 )
 
 QUOTA_MIB_PER_GIB = 1024
@@ -171,6 +173,35 @@ def validate_share_modify_request(request: ShareModifyRequest) -> ShareModifyReq
         else _validate_nfs_permissions(request.nfs_permissions)
     )
     return replace(request, name=name, nfs_permissions=nfs_permissions)
+
+
+def validate_subshare_create_request(
+    request: SubshareCreateRequest,
+) -> SubshareCreateRequest:
+    if not isinstance(request, SubshareCreateRequest):
+        raise ConfigurationError("invalid subshare creation request")
+    if not isinstance(request.share, str) or not isinstance(request.directory, str):
+        raise ConfigurationError("subshare share and directory must be strings")
+    if unicodedata.normalize("NFC", request.directory) != request.directory:
+        raise ConfigurationError("subshare directory must use NFC Unicode")
+    share = unicodedata.normalize("NFC", request.share).strip()
+    directory = request.directory
+    if not share:
+        raise ConfigurationError("share name must not be empty")
+    if share in {".", ".."} or any(character in {"/", "\\"} for character in share):
+        raise ConfigurationError("share name contains invalid characters")
+    if _contains_control_characters(share):
+        raise ConfigurationError("share name contains invalid characters")
+    if (
+        not directory
+        or directory in {".", ".."}
+        or "/" in directory
+        or "\\" in directory
+        or _contains_control_characters(directory)
+        or directory.strip() != directory
+    ):
+        raise ConfigurationError("subshare directory must be one safe path component")
+    return SubshareCreateRequest(share=share, directory=directory)
 
 
 def validate_share_delete_request(request: ShareDeleteRequest) -> ShareDeleteRequest:

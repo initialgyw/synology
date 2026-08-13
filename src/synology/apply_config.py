@@ -12,6 +12,7 @@ from synology.config import (
     MAX_QUOTA_GIB,
     normalize_nfs_client,
     validate_share_create_request,
+    validate_subshare_create_request,
 )
 from synology.exceptions import (
     ApiError,
@@ -21,6 +22,7 @@ from synology.exceptions import (
 )
 from synology.models import (
     AclPermissionRecord,
+    ApplyDirectoryPreflight,
     NfsAccessMode,
     NfsClientPermission,
     NfsRootSquash,
@@ -36,9 +38,16 @@ from synology.models import (
     ShareDetails,
     ShareRecord,
     ShareScalarUpdateRequest,
+    SubshareCreateRequest,
 )
 
 _MISSING = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyDirectory:
+    name: str
+    state: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +59,7 @@ class ApplyShare:
     quota_mib: int | None
     acl: tuple[PermissionSpec, ...]
     nfs: tuple[NfsClientPermission, ...]
+    directories: tuple[ApplyDirectory, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +76,8 @@ class ApplyOperation:
     before: str
     after: str
     status: OperationStatus = OperationStatus.PLANNED
+    directory: ApplyDirectory | None = None
+    directory_preflight: ApplyDirectoryPreflight | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +97,18 @@ class ApplyClient(Protocol):
     ) -> None: ...
 
     def preflight_apply_create(self) -> None: ...
+
+    def preflight_apply_directory(
+        self, share: str, directory: str
+    ) -> ApplyDirectoryPreflight: ...
+
+    def preflight_future_apply_directory(
+        self, share: str, volume: str, directory: str
+    ) -> ApplyDirectoryPreflight: ...
+
+    def create_apply_directory(self, preflight: ApplyDirectoryPreflight) -> object: ...
+
+    def delete_apply_directory(self, preflight: ApplyDirectoryPreflight) -> object: ...
 
     def create_share(self, request: ShareCreateRequest) -> object: ...
 
@@ -175,6 +199,7 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
             raise ApiError("duplicate live share name in inventory")
         inventory[share.name] = share
     existing: dict[str, ShareDetails] = {}
+    directory_preflights: dict[tuple[str, str], ApplyDirectoryPreflight] = {}
     new_shares: list[ApplyShare] = []
     effective_descriptions: dict[str, str] = {}
 
@@ -190,6 +215,12 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
                 if desired.description is _MISSING
                 else cast(str, desired.description)
             )
+            for directory in desired.directories:
+                directory_preflights[desired.name, directory.name] = (
+                    client.preflight_future_apply_directory(
+                        desired.name, desired.volume, directory.name
+                    )
+                )
             continue
         if listed.volume != desired.volume:
             raise ApiError(f"share {desired.name} exists on a different volume")
@@ -202,6 +233,10 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
             if desired.description is _MISSING
             else cast(str, desired.description)
         )
+        for directory in desired.directories:
+            preflight = client.preflight_apply_directory(desired.name, directory.name)
+            _validate_directory_preflight(directory, preflight)
+            directory_preflights[desired.name, directory.name] = preflight
 
     if new_shares:
         client.preflight_apply_create()
@@ -221,6 +256,7 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
                 )
         elif listed is None:
             operations.extend(_create_operations(desired))
+            operations.extend(_directory_operations(desired, directory_preflights))
         else:
             operations.extend(
                 _existing_operations(
@@ -229,6 +265,7 @@ def build_apply_plan(config: ApplyConfig, client: ApplyClient) -> ApplyPlan:
                     effective_descriptions[desired.name],
                 )
             )
+            operations.extend(_directory_operations(desired, directory_preflights))
     return ApplyPlan(
         config=config,
         operations=tuple(operations),
@@ -294,6 +331,7 @@ def execute_apply_plan(plan: ApplyPlan, client: ApplyClient) -> ApplyPlan:
                 OperationStatus.UNKNOWN
                 if isinstance(exc, PartialOperationError)
                 else OperationStatus.FAILED,
+                operation.directory,
             )
             remaining = [
                 ApplyOperation(
@@ -302,6 +340,7 @@ def execute_apply_plan(plan: ApplyPlan, client: ApplyClient) -> ApplyPlan:
                     item.before,
                     item.after,
                     OperationStatus.SKIPPED,
+                    item.directory,
                 )
                 for item in plan.operations[len(completed) + 1 :]
             ]
@@ -320,6 +359,7 @@ def execute_apply_plan(plan: ApplyPlan, client: ApplyClient) -> ApplyPlan:
                 operation.before,
                 operation.after,
                 OperationStatus.SUCCEEDED,
+                operation.directory,
             )
         )
     return ApplyPlan(plan.config, tuple(completed))
@@ -360,17 +400,11 @@ def _execute_operation(
             if desired.quota_mib is not None
             else (0 if _canonical_volume(desired.volume) else None)
         )
-        if (
-            observed.description != description
-            or (
-                expected_quota is not None
-                and observed.quota_api_value != expected_quota
-            )
+        if observed.description != description or (
+            expected_quota is not None and observed.quota_api_value != expected_quota
         ):
             client.update_share_scalars(
-                ShareScalarUpdateRequest(
-                    desired.name, description, expected_quota
-                )
+                ShareScalarUpdateRequest(desired.name, description, expected_quota)
             )
             verified = client.read_apply_details(desired.name).share
             if (
@@ -418,6 +452,35 @@ def _execute_operation(
         _validate_details(nfs_observed, desired.name)
         if _nfs_set(nfs_observed.nfs_permissions) != _nfs_set(desired.nfs):
             raise PartialOperationError("NFS read-back did not match", None)
+    elif operation.family == "directory":
+        if operation.directory is None:
+            raise RuntimeError("directory operation has no directory")
+        directory_current = operation.directory_preflight
+        if directory_current is None or directory_current.future:
+            directory_current = client.preflight_apply_directory(
+                desired.name, operation.directory.name
+            )
+        _validate_directory_preflight(operation.directory, directory_current)
+        if operation.directory.state == "present":
+            if directory_current.target_kind == "missing":
+                client.create_apply_directory(directory_current)
+            directory_verified = client.preflight_apply_directory(
+                desired.name, operation.directory.name
+            )
+            if directory_verified.target_kind != "directory":
+                raise PartialOperationError(
+                    "directory creation verification failed", None
+                )
+        else:
+            if directory_current.target_kind == "directory":
+                client.delete_apply_directory(directory_current)
+            directory_verified = client.preflight_apply_directory(
+                desired.name, operation.directory.name
+            )
+            if directory_verified.target_kind != "missing":
+                raise PartialOperationError(
+                    "directory deletion verification failed", None
+                )
     elif operation.family == "delete":
         client.delete_share(ShareDeleteRequest(desired.name))
 
@@ -430,6 +493,55 @@ def _create_operations(desired: ApplyShare) -> list[ApplyOperation]:
         ),
         ApplyOperation(desired.name, "nfs", "unknown rules", _nfs_text(desired.nfs)),
     ]
+
+
+def _directory_operations(
+    desired: ApplyShare,
+    preflights: Mapping[tuple[str, str], ApplyDirectoryPreflight],
+) -> list[ApplyOperation]:
+    operations: list[ApplyOperation] = []
+    for directory in desired.directories:
+        preflight = preflights[desired.name, directory.name]
+        if directory.state == "present" and preflight.target_kind == "missing":
+            operations.append(
+                ApplyOperation(
+                    desired.name,
+                    "directory",
+                    "absent",
+                    "present",
+                    directory=directory,
+                    directory_preflight=preflight,
+                )
+            )
+        elif directory.state == "absent" and preflight.target_kind == "directory":
+            operations.append(
+                ApplyOperation(
+                    desired.name,
+                    "directory",
+                    "present",
+                    "absent",
+                    directory=directory,
+                    directory_preflight=preflight,
+                )
+            )
+    return operations
+
+
+def _validate_directory_preflight(
+    directory: ApplyDirectory, preflight: ApplyDirectoryPreflight
+) -> None:
+    if preflight.target_kind == "file":
+        raise ConfigurationError(
+            f"directory target is not a directory: {directory.name}"
+        )
+    if preflight.target_kind not in {"missing", "directory"}:
+        raise ApiError("invalid directory preflight response")
+    if (
+        directory.state == "absent"
+        and preflight.target_kind == "directory"
+        and not preflight.empty
+    ):
+        raise ConfigurationError(f"directory target is not empty: {directory.name}")
 
 
 def _existing_operations(
@@ -512,18 +624,22 @@ def _validate_details(details: ShareDetails, name: str) -> None:
 
 
 def _share(data: Mapping[str, object], volume: str) -> ApplyShare:
-    _keys(data, {"name", "state", "description", "quota", "acl", "nfs"}, "share")
+    _keys(
+        data,
+        {"name", "state", "description", "quota", "acl", "nfs", "directories"},
+        "share",
+    )
     name = data.get("name")
     if not isinstance(name, str):
         raise ConfigurationError("share name must be a string")
     validate_share_create_request(ShareCreateRequest(name, volume))
     state = data.get("state", "present")
-    if state not in {"present", "absent"}:
+    if not isinstance(state, str) or state not in {"present", "absent"}:
         raise ConfigurationError("share state must be present or absent")
     if state == "absent":
         if set(data) != {"name", "state"}:
             raise ConfigurationError("absent shares allow only name and state")
-        return ApplyShare(name.strip(), volume, state, _MISSING, 0, (), ())
+        return ApplyShare(name.strip(), volume, state, _MISSING, 0, (), (), ())
     description = _optional_text(data.get("description", _MISSING), "description")
     quota = data.get("quota", _MISSING)
     if quota is _MISSING:
@@ -544,7 +660,35 @@ def _share(data: Mapping[str, object], volume: str) -> ApplyShare:
         quota_mib,
         _acl(data.get("acl", _MISSING)),
         _nfs(data.get("nfs", _MISSING)),
+        _directories(data.get("directories", _MISSING), name.strip()),
     )
+
+
+def _directories(value: object, share: str) -> tuple[ApplyDirectory, ...]:
+    if value is _MISSING:
+        return ()
+    directories: list[ApplyDirectory] = []
+    names: set[str] = set()
+    for entry in _sequence(value, "directories"):
+        data = _mapping(entry, "directory")
+        _keys(data, {"name", "state"}, "directory")
+        name = _required_text(data.get("name"), "directory name")
+        try:
+            validated = validate_subshare_create_request(
+                SubshareCreateRequest(share, name)
+            )
+        except ConfigurationError as exc:
+            raise ConfigurationError(
+                "directory name must be one safe path component"
+            ) from exc
+        state = data.get("state", "present")
+        if not isinstance(state, str) or state not in {"present", "absent"}:
+            raise ConfigurationError("directory state must be present or absent")
+        if validated.directory in names:
+            raise ConfigurationError("duplicate directory names are not allowed")
+        names.add(validated.directory)
+        directories.append(ApplyDirectory(validated.directory, state))
+    return tuple(sorted(directories, key=lambda item: item.name))
 
 
 def _acl(value: object) -> tuple[PermissionSpec, ...]:
@@ -850,15 +994,20 @@ class _UniqueKeyLoader(yaml.SafeLoader):
     pass
 
 
+class _YamlObjectConstructor(Protocol):
+    def construct_object(self, node: object, deep: bool = False) -> object: ...
+
+
 def _construct_mapping(
     loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
 ) -> dict[object, object]:
     mapping: dict[object, object] = {}
+    constructor = cast(_YamlObjectConstructor, loader)
     for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
+        key = constructor.construct_object(key_node, deep=deep)
         if key in mapping:
             raise ConfigurationError("duplicate YAML key")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
+        mapping[key] = constructor.construct_object(value_node, deep=deep)
     return mapping
 
 

@@ -9,9 +9,11 @@ from synology.exceptions import OutputError
 from synology.models import (
     AclPermissionRecord,
     EnrichmentStatus,
+    ListDirsResult,
     NfsClientPermission,
     NfsDisplayPermission,
     NfsRootSquash,
+    OperationStatus,
     OutputFormat,
     PermissionSpec,
     ShareCreateResult,
@@ -20,7 +22,77 @@ from synology.models import (
     ShareModifyResult,
     ShareOperationStep,
     ShareRecord,
+    SubshareCreateResult,
+    SubshareDeleteResult,
 )
+
+
+def render_subshare_delete(
+    result: SubshareDeleteResult, output_format: OutputFormat
+) -> str:
+    try:
+        record = {
+            "share": result.share,
+            "directory": result.directory,
+            "path": result.path,
+            "virtual_path": result.virtual_path,
+            "deleted": result.deleted,
+            "status": result.status,
+            "mode": "empty-only",
+            "steps": [_step_record(step) for step in result.steps],
+        }
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        if output_format is OutputFormat.YAML:
+            return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+        return "\n".join(
+            (
+                "SHARE  DIRECTORY  PATH  MODE  STATUS",
+                "-----  ---------  ----  ----  ------",
+                f"{result.share}  {result.directory}  {result.path or '-'}  "
+                f"empty-only  {result.status}",
+            )
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
+
+
+def render_list_dirs(result: ListDirsResult, output_format: OutputFormat) -> str:
+    try:
+        record = {
+            "share": result.share,
+            "directories": [
+                {"name": item.name, "path": item.path} for item in result.directories
+            ],
+        }
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        if output_format is OutputFormat.YAML:
+            return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+        if not result.directories:
+            return f"SHARE: {result.share}\nNo directories found."
+        headers = ["NAME", "PATH"]
+        rows = [[item.name, item.path] for item in result.directories]
+        widths = [
+            max(len(headers[index]), *(len(row[index]) for row in rows))
+            for index in range(len(headers))
+        ]
+        return "\n".join(
+            [
+                "  ".join(
+                    header.ljust(widths[index]) for index, header in enumerate(headers)
+                ),
+                "  ".join("-" * width for width in widths),
+                *[
+                    "  ".join(
+                        value.ljust(widths[index]) for index, value in enumerate(row)
+                    )
+                    for row in rows
+                ],
+            ]
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
 
 
 def render_config_import(
@@ -78,6 +150,16 @@ def render_apply_plan(
                     "before": item.before,
                     "after": item.after,
                     "status": item.status.value,
+                    **(
+                        {
+                            "directory": {
+                                "name": item.directory.name,
+                                "state": item.directory.state,
+                            }
+                        }
+                        if item.directory is not None
+                        else {}
+                    ),
                 }
                 for item in plan.operations
             ],
@@ -88,9 +170,16 @@ def render_apply_plan(
             return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
         if not plan.operations:
             return f"MODE: {mode}\nHOST: {host}\nNo changes."
-        headers = ["SHARE", "FAMILY", "BEFORE", "AFTER", "STATUS"]
+        headers = ["SHARE", "DIRECTORY", "FAMILY", "BEFORE", "AFTER", "STATUS"]
         rows = [
-            [item.share, item.family, item.before, item.after, item.status.value]
+            [
+                item.share,
+                item.directory.name if item.directory is not None else "-",
+                item.family,
+                item.before,
+                item.after,
+                item.status.value,
+            ]
             for item in plan.operations
         ]
         widths = [
@@ -261,6 +350,44 @@ def render_share_create(result: ShareCreateResult, output_format: OutputFormat) 
         return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
     except (TypeError, ValueError, yaml.YAMLError) as exc:
         raise OutputError("unable to render output") from exc
+
+
+def render_subshare_create(
+    result: SubshareCreateResult, output_format: OutputFormat
+) -> str:
+    try:
+        record = {
+            "share": result.share,
+            "directory": result.directory,
+            "path": result.path,
+            "created": result.created,
+            "steps": [_step_record(step) for step in result.steps],
+        }
+        if output_format is OutputFormat.JSON:
+            return json.dumps(record, ensure_ascii=False)
+        if output_format is OutputFormat.YAML:
+            return yaml.safe_dump(record, allow_unicode=True, sort_keys=False).rstrip()
+        status = _subshare_status(result)
+        return "\n".join(
+            (
+                "SHARE  DIRECTORY  PATH  STATUS",
+                "-----  ---------  ----  ------",
+                f"{result.share}  {result.directory}  {result.path or '-'}  {status}",
+            )
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise OutputError("unable to render output") from exc
+
+
+def _subshare_status(result: SubshareCreateResult) -> str:
+    if result.created:
+        return "created"
+    statuses = {step.status for step in result.steps}
+    if OperationStatus.UNKNOWN in statuses:
+        return "unknown"
+    if OperationStatus.FAILED in statuses:
+        return "failed"
+    return "planned"
 
 
 def render_share_delete(result: ShareDeleteResult, output_format: OutputFormat) -> str:

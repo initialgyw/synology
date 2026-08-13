@@ -36,6 +36,8 @@ from synology.models import (
     ShareRecord,
 )
 
+_MISSING = object()
+
 
 @dataclass(frozen=True, slots=True)
 class ConfigImportDocument:
@@ -202,6 +204,7 @@ def _imported_share(details: ShareDetails, target: str) -> ApplyShare:
         quota,
         acl,
         nfs,
+        (),
     )
 
 
@@ -274,6 +277,7 @@ def _merge(document: object, imported: ApplyShare, host: str) -> object:
     if not isinstance(volumes, Mapping):
         raise ConfigurationError("volumes must be a mapping")
     volumes = cast(Any, volumes)
+    preserved_directories: object = _MISSING
     for _volume, value in volumes.items():
         if not isinstance(value, Mapping):
             continue
@@ -284,6 +288,8 @@ def _merge(document: object, imported: ApplyShare, host: str) -> object:
         for index in range(len(shares) - 1, -1, -1):
             item = shares[index]
             if isinstance(item, Mapping) and item.get("name") == imported.name:
+                if "directories" in item:
+                    preserved_directories = item["directories"]
                 del shares[index]
     volume = volumes.get(imported.volume)
     if volume is None:
@@ -298,7 +304,10 @@ def _merge(document: object, imported: ApplyShare, host: str) -> object:
         volume["shares"] = shares
     if not isinstance(shares, list):
         raise ConfigurationError("volume shares must be a list")
-    shares.append(_share_node(imported))
+    node = _share_node(imported)
+    if preserved_directories is not _MISSING:
+        cast(Any, node)["directories"] = preserved_directories
+    shares.append(node)
     return root
 
 

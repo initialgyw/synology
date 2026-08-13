@@ -21,6 +21,7 @@ from synology.exceptions import (
 )
 from synology.models import (
     AclPermissionRecord,
+    ApplyDirectoryPreflight,
     EnrichmentStatus,
     NfsAccessMode,
     NfsClientPermission,
@@ -555,6 +556,144 @@ def test_apply_nfs_parser_accepts_exact_dsm_root_squash_tokens(tmp_path, root_sq
     assert config.shares[0].nfs[0].root_squash is root_squash
 
 
+def test_apply_directory_parser_defaults_and_rejects_invalid_entries(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volume1:\n    shares:\n      - name: projects\n"
+        "        directories:\n          - name: longhorn\n          - name: retired\n"
+        "            state: absent\n",
+    )
+    assert [(item.name, item.state) for item in config.shares[0].directories] == [
+        ("longhorn", "present"),
+        ("retired", "absent"),
+    ]
+    for directories in (
+        "          - name: a/b\n",
+        "          - name: a\n            extra: true\n",
+        "          - name: a\n          - name: a\n",
+    ):
+        with pytest.raises(ConfigurationError):
+            _config(
+                tmp_path,
+                "version: 1\nvolumes:\n  /volume1:\n    shares:\n"
+                "      - name: projects\n"
+                f"        directories:\n{directories}",
+            )
+    with pytest.raises(ConfigurationError, match="absent shares"):
+        _config(
+            tmp_path,
+            "version: 1\nvolumes:\n  /volume1:\n    shares:\n      - name: projects\n"
+            "        state: absent\n        directories: []\n",
+        )
+
+
+class DirectoryClient(RecordingClient):
+    def __init__(self, shares=(), details=None, directories=None):
+        super().__init__(shares, details)
+        self.directories = {} if directories is None else directories
+
+    def preflight_apply_directory(self, share, directory):
+        self.calls.append(f"dir-preflight:{share}:{directory}")
+        kind, empty = self.directories.get((share, directory), ("missing", None))
+        return ApplyDirectoryPreflight(
+            share,
+            directory,
+            f"/volume1/{share}/{directory}",
+            f"/{share}/{directory}",
+            kind,
+            empty,
+        )
+
+    def preflight_future_apply_directory(self, share, volume, directory):
+        self.calls.append(f"future-dir:{share}:{directory}")
+        return ApplyDirectoryPreflight(
+            share,
+            directory,
+            f"{volume}/{share}/{directory}",
+            None,
+            "missing",
+            None,
+        )
+
+    def create_apply_directory(self, preflight):
+        self.calls.append(f"dir-create:{preflight.share}:{preflight.directory}")
+        self.directories[preflight.share, preflight.directory] = ("directory", True)
+
+    def delete_apply_directory(self, preflight):
+        self.calls.append(f"dir-delete:{preflight.share}:{preflight.directory}")
+        self.directories.pop((preflight.share, preflight.directory), None)
+
+
+def test_apply_directories_manage_only_listed_targets_and_execute(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volume1:\n    shares:\n"
+        "      - name: projects\n"
+        "        directories:\n          - name: create\n          - name: remove\n"
+        "            state: absent\n",
+    )
+    client = DirectoryClient(
+        (ShareRecord("projects", "/volume1"),),
+        {"projects": _details()},
+        {
+            ("projects", "remove"): ("directory", True),
+            ("projects", "untouched"): ("directory", False),
+        },
+    )
+    plan = build_apply_plan(config, client)
+    assert [(item.directory.name, item.after) for item in plan.operations] == [
+        ("create", "present"),
+        ("remove", "absent"),
+    ]
+    result = execute_apply_plan(plan, client)
+    assert all(item.status is OperationStatus.SUCCEEDED for item in result.operations)
+    assert ("projects", "untouched") in client.directories
+    assert "dir-create:projects:create" in client.calls
+    assert "dir-delete:projects:remove" in client.calls
+
+
+@pytest.mark.parametrize(
+    "target",
+    [("file", None), ("directory", False)],
+)
+def test_apply_directory_invalid_targets_fail_before_writes(tmp_path, target):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volume1:\n    shares:\n      - name: projects\n"
+        "        directories:\n          - name: target\n            state: absent\n",
+    )
+    client = DirectoryClient(
+        (ShareRecord("projects", "/volume1"),),
+        {"projects": _details()},
+        {("projects", "target"): target},
+    )
+    with pytest.raises(ConfigurationError):
+        build_apply_plan(config, client)
+    assert not any(
+        "dir-create" in call or "dir-delete" in call for call in client.calls
+    )
+
+
+def test_new_usb_share_directory_is_preflighted_then_created(tmp_path):
+    config = _config(
+        tmp_path,
+        "version: 1\nvolumes:\n  /volumeUSB1/usbshare:\n    shares:\n"
+        "      - name: backups\n"
+        "        directories:\n          - name: longhorn\n",
+    )
+    client = DirectoryClient(
+        details={"backups": _details("backups", volume="/volumeUSB1/usbshare")}
+    )
+    plan = build_apply_plan(config, client)
+    assert "future-dir:backups:longhorn" in client.calls
+    assert [item.family for item in plan.operations] == [
+        "create",
+        "acl",
+        "nfs",
+        "directory",
+    ]
+
+
 @pytest.mark.parametrize(
     "root_squash",
     ["no_root_squash", "none", "all_squash", "map_root", "ROOT", "Admin", "unknown"],
@@ -766,11 +905,7 @@ def test_external_explicit_quota_fails_before_all_writes(tmp_path):
     )
     client = RecordingClient(
         (ShareRecord("backups", "/volumeUSB1/usbshare"),),
-        {
-            "backups": _details(
-                "backups", volume="/volumeUSB1/usbshare", quota=None
-            )
-        },
+        {"backups": _details("backups", volume="/volumeUSB1/usbshare", quota=None)},
     )
 
     with pytest.raises(ApiError, match="backups.*volumeUSB1.*quota"):

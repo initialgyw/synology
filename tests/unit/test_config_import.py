@@ -36,9 +36,7 @@ from synology.output import render_config_import
 
 def test_external_import_omits_unavailable_quota_and_stays_v1_valid() -> None:
     details = ShareDetails(
-        ShareRecord(
-            "backups", "/volumeUSB1/usbshare", "backup", quota_api_value=None
-        ),
+        ShareRecord("backups", "/volumeUSB1/usbshare", "backup", quota_api_value=None),
         acl_status=EnrichmentStatus.EMPTY,
         nfs_status=EnrichmentStatus.EMPTY,
     )
@@ -400,9 +398,7 @@ def test_oversized_aligned_live_quota_is_an_api_error_with_exit_40(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     document = _document(tmp_path, tree={"version": 1, "volumes": {}})
-    client = ReadOnlyClient(
-        _details(quota=(MAX_QUOTA_GIB + 1) * QUOTA_MIB_PER_GIB)
-    )
+    client = ReadOnlyClient(_details(quota=(MAX_QUOTA_GIB + 1) * QUOTA_MIB_PER_GIB))
     monkeypatch.setattr(cli, "load_config_import_document", lambda path: document)
 
     result = run(
