@@ -1,7 +1,11 @@
 import json
 import logging as stdlib_logging
 from collections.abc import Mapping, Sequence
-from typing import Any, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Any, NoReturn, Protocol, cast
+
+if TYPE_CHECKING:
+    from synology.models import ApplyDirectoryPreflight
+    from synology.subshares import SynSubshareClient
 
 from requests.exceptions import RequestException
 from synology_api.exceptions import (
@@ -38,6 +42,8 @@ from synology.models import (
     ConnectionConfig,
     EnrichmentDiagnostic,
     EnrichmentStatus,
+    ListDirsRequest,
+    ListDirsResult,
     MutableShareState,
     NfsAccessMode,
     NfsClientPermission,
@@ -66,6 +72,12 @@ from synology.models import (
     ShareRecord,
     ShareScalarUpdatePayload,
     ShareScalarUpdateRequest,
+    SubshareCreateRequest,
+    SubshareCreateResult,
+    SubshareDeletePreflightResult,
+    SubshareDeleteRequest,
+    SubshareDeleteResult,
+    SubsharePreflightResult,
 )
 
 SHARE_OPERATION = "SYNO.Core.Share.list"
@@ -196,6 +208,55 @@ class SynShareClient:
         self._nfs_factory = nfs_factory or _default_nfs_factory
         self._permission: SharePermissionApi | None = None
         self._nfs: NfsRawApi | None = None
+
+    def _subshare_client(self) -> "SynSubshareClient":
+        from synology.subshares import SynSubshareClient
+
+        return SynSubshareClient(self._config, self._logger)
+
+    def list_dirs(self, request: ListDirsRequest) -> ListDirsResult:
+        return self._subshare_client().list_dirs(request)
+
+    def preflight_apply_directory(
+        self, share: str, directory: str
+    ) -> "ApplyDirectoryPreflight":
+        return self._subshare_client().preflight_apply_directory(share, directory)
+
+    def preflight_future_apply_directory(
+        self, share: str, volume: str, directory: str
+    ) -> "ApplyDirectoryPreflight":
+        return self._subshare_client().preflight_future_apply_directory(
+            share, volume, directory
+        )
+
+    def create_apply_directory(self, preflight: "ApplyDirectoryPreflight") -> object:
+        return self._subshare_client().create_apply_directory(preflight)
+
+    def delete_apply_directory(self, preflight: "ApplyDirectoryPreflight") -> object:
+        return self._subshare_client().delete_apply_directory(preflight)
+
+    def preflight_delete_dir(
+        self, request: SubshareDeleteRequest
+    ) -> SubshareDeletePreflightResult:
+        return self._subshare_client().preflight_delete_dir(request)
+
+    def delete_preflighted_dir(
+        self, preflight: SubshareDeletePreflightResult
+    ) -> SubshareDeleteResult:
+        return self._subshare_client().delete_preflighted_dir(preflight)
+
+    def preflight_subshare(
+        self, request: SubshareCreateRequest
+    ) -> SubsharePreflightResult:
+        return self._subshare_client().preflight_subshare(request)
+
+    def create_preflighted_subshare(
+        self, preflight: SubsharePreflightResult
+    ) -> SubshareCreateResult:
+        return self._subshare_client().create_preflighted_subshare(preflight)
+
+    def create_subshare(self, request: SubshareCreateRequest) -> SubshareCreateResult:
+        return self._subshare_client().create_subshare(request)
 
     def create_share(self, request: ShareCreateRequest) -> ShareCreateResult:
         request = validate_share_create_request(request)
@@ -876,9 +937,9 @@ class SynShareClient:
                 method="post",
             )
             if (
-                _as_mapping(
-                    response, "invalid share scalar update response"
-                ).get("success")
+                _as_mapping(response, "invalid share scalar update response").get(
+                    "success"
+                )
                 is not True
             ):
                 raise ApiError(

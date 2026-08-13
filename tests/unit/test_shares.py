@@ -655,9 +655,7 @@ def test_create_share_forwards_quota_when_requested() -> None:
 
 
 def test_create_external_share_omits_unavailable_scalar_options() -> None:
-    share = FakeShare(
-        create_response={"success": True, "data": {"name": "backups"}}
-    )
+    share = FakeShare(create_response={"success": True, "data": {"name": "backups"}})
     client = SynShareClient(_config(), _logger(), factory=FakeFactory(share))
 
     client.create_share(

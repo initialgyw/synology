@@ -19,6 +19,7 @@ from synology.config import (
     validate_share_create_request,
     validate_share_delete_request,
     validate_share_modify_request,
+    validate_subshare_create_request,
 )
 from synology.config_import import (
     ConfigImportClient,
@@ -41,6 +42,8 @@ from synology.models import (
     CliArguments,
     Command,
     ConnectionConfig,
+    ListDirsRequest,
+    ListDirsResult,
     NfsClientPermission,
     OperationStatus,
     OutputFormat,
@@ -56,22 +59,53 @@ from synology.models import (
     ShareModifyResult,
     ShareOperationStep,
     ShareRecord,
+    SubshareCreateRequest,
+    SubshareCreateResult,
+    SubshareDeletePreflightResult,
+    SubshareDeleteRequest,
+    SubshareDeleteResult,
+    SubsharePreflightResult,
 )
 from synology.output import (
     apply_plan_warnings,
     render_apply_plan,
     render_config_import,
+    render_list_dirs,
     render_share_create,
     render_share_delete,
     render_share_details,
     render_share_modify,
     render_shares,
+    render_subshare_create,
+    render_subshare_delete,
 )
 from synology.shares import SynShareClient
 
 
 class ShareClient(Protocol):
     def list_shares(self) -> tuple[ShareRecord, ...]: ...
+
+    def list_dirs(self, request: ListDirsRequest) -> ListDirsResult: ...
+
+    def preflight_delete_dir(
+        self, request: SubshareDeleteRequest
+    ) -> SubshareDeletePreflightResult: ...
+
+    def delete_preflighted_dir(
+        self, preflight: SubshareDeletePreflightResult
+    ) -> SubshareDeleteResult: ...
+
+    def create_subshare(
+        self, request: SubshareCreateRequest
+    ) -> SubshareCreateResult: ...
+
+    def preflight_subshare(
+        self, request: SubshareCreateRequest
+    ) -> SubsharePreflightResult: ...
+
+    def create_preflighted_subshare(
+        self, preflight: SubsharePreflightResult
+    ) -> SubshareCreateResult: ...
 
     def list_share_details(self) -> tuple[ShareDetails, ...]: ...
 
@@ -180,6 +214,95 @@ def run(
             _write_output(
                 render_apply_plan(
                     result, arguments.output, mode="apply", host=config.host
+                ),
+                stdout,
+            )
+            return 0
+        if arguments.command is Command.RM_DIR:
+            rm_dir_request = SubshareDeleteRequest(arguments.share, arguments.directory)
+            factory = (
+                _default_client_factory if client_factory is None else client_factory
+            )
+            config = resolve_connection_config(arguments, environ=environ)
+            if config.insecure:
+                logger.warning("TLS certificate verification is disabled")
+            client = factory(config, logger)
+            rm_dir_preflight = client.preflight_delete_dir(rm_dir_request)
+            if not arguments.confirm:
+                _write_output(
+                    render_subshare_delete(
+                        SubshareDeleteResult(
+                            rm_dir_preflight.share,
+                            rm_dir_preflight.directory,
+                            rm_dir_preflight.path,
+                            rm_dir_preflight.virtual_path,
+                            False,
+                            "planned",
+                            (
+                                *rm_dir_preflight.steps,
+                                ShareOperationStep("delete", OperationStatus.PLANNED),
+                            ),
+                        ),
+                        arguments.output,
+                    ),
+                    stdout,
+                )
+                return 0
+            _write_output(
+                render_subshare_delete(
+                    client.delete_preflighted_dir(rm_dir_preflight), arguments.output
+                ),
+                stdout,
+            )
+            return 0
+        if arguments.command is Command.LIST_DIRS:
+            list_dirs_request = ListDirsRequest(arguments.share)
+            factory = (
+                _default_client_factory if client_factory is None else client_factory
+            )
+            config = resolve_connection_config(arguments, environ=environ)
+            if config.insecure:
+                logger.warning("TLS certificate verification is disabled")
+            client = factory(config, logger)
+            _write_output(
+                render_list_dirs(client.list_dirs(list_dirs_request), arguments.output),
+                stdout,
+            )
+            return 0
+        if arguments.command is Command.ADD_DIR:
+            subshare_request = validate_subshare_create_request(
+                SubshareCreateRequest(arguments.share, arguments.directory)
+            )
+            factory = (
+                _default_client_factory if client_factory is None else client_factory
+            )
+            config = resolve_connection_config(arguments, environ=environ)
+            if config.insecure:
+                logger.warning("TLS certificate verification is disabled")
+            client = factory(config, logger)
+            preflight = client.preflight_subshare(subshare_request)
+            if not arguments.confirm:
+                _write_output(
+                    render_subshare_create(
+                        SubshareCreateResult(
+                            preflight.share,
+                            preflight.directory,
+                            preflight.path,
+                            False,
+                            (
+                                *preflight.steps,
+                                ShareOperationStep("create", OperationStatus.PLANNED),
+                                ShareOperationStep("verify", OperationStatus.PLANNED),
+                            ),
+                        ),
+                        arguments.output,
+                    ),
+                    stdout,
+                )
+                return 0
+            _write_output(
+                render_subshare_create(
+                    client.create_preflighted_subshare(preflight), arguments.output
                 ),
                 stdout,
             )
@@ -362,6 +485,10 @@ def run(
                 rendered = render_share_modify(partial_result, arguments.output)
             elif isinstance(partial_result, ShareCreateResult):
                 rendered = render_share_create(partial_result, arguments.output)
+            elif isinstance(partial_result, SubshareCreateResult):
+                rendered = render_subshare_create(partial_result, arguments.output)
+            elif isinstance(partial_result, SubshareDeleteResult):
+                rendered = render_subshare_delete(partial_result, arguments.output)
             else:
                 raise OutputError("unable to render partial operation output")
             _write_output(rendered, stdout)
@@ -410,8 +537,8 @@ def _build_parser() -> _CliArgumentParser:
             "  syn-cli create-share nfs-data --path /volume1 "
             "--nfs-permission 'client=10.192.10.0/24,access=read-write' --yes\n"
             "  syn-cli modify-share projects --permission ''\n\n"
-            "Create, delete, and modify operations require --yes to contact the NAS; "
-            "without it, a local plan is printed and exit code 11 is returned."
+            "Create, delete, and modify operations require --yes to mutate the NAS; "
+            "add-dir performs a read-only NAS preflight without --yes."
         ),
     )
     _add_global_options(parser)
@@ -441,6 +568,68 @@ def _build_parser() -> _CliArgumentParser:
         choices=tuple(item.value for item in OutputFormat),
         default=OutputFormat.TABLE.value,
         help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    rm_dir = subparsers.add_parser(
+        "rm-dir",
+        help="Remove one empty child directory from a shared folder.",
+        description=(
+            "Remove exactly one empty child directory. Without --yes, perform only "
+            "a read-only NAS preflight."
+        ),
+    )
+    _add_global_options(rm_dir)
+    rm_dir.add_argument("directory", help="Single empty child directory name.")
+    rm_dir.add_argument(
+        "-s", "--share", required=True, help="Existing shared-folder name."
+    )
+    rm_dir.add_argument(
+        "--yes", dest="confirm", action="store_true", help="Confirm NAS mutation."
+    )
+    rm_dir.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    list_dirs = subparsers.add_parser(
+        "list-dirs",
+        help="List immediate child directories in a shared folder.",
+        description=(
+            "List all immediate child directories in an existing shared folder."
+        ),
+    )
+    _add_global_options(list_dirs)
+    list_dirs.add_argument(
+        "-s", "--share", required=True, help="Existing shared-folder name."
+    )
+    list_dirs.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
+        help="Output format: table, json, or yaml. Defaults to table.",
+    )
+    add_dir = subparsers.add_parser(
+        "add-dir",
+        help="Create one child directory inside a shared folder.",
+        description=(
+            "Create exactly one non-idempotent child directory under a shared folder."
+        ),
+    )
+    _add_global_options(add_dir)
+    add_dir.add_argument("directory", help="Single child directory name.")
+    add_dir.add_argument(
+        "-s", "--share", required=True, help="Existing shared-folder name."
+    )
+    add_dir.add_argument(
+        "--yes", dest="confirm", action="store_true", help="Confirm NAS mutation."
+    )
+    add_dir.add_argument(
+        "-o",
+        "--output",
+        choices=tuple(item.value for item in OutputFormat),
+        default=OutputFormat.TABLE.value,
     )
     create_share = subparsers.add_parser(
         "create-share",
@@ -714,6 +903,8 @@ def _parse_arguments(
             output=OutputFormat(_string(values.get("output"), "output")),
             command=Command(_string(values.get("command"), "command")),
             name=_optional_string(values.get("name"), "name") or "",
+            share=_optional_string(values.get("share"), "share") or "",
+            directory=_optional_string(values.get("directory"), "directory") or "",
             volume_path=_optional_string(values.get("volume_path"), "volume_path")
             or "",
             description=_optional_string(values.get("description"), "description")

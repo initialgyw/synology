@@ -20,6 +20,10 @@ volumes:
       - name: projects
         description: Project files
         quota: 200
+        directories:
+          - name: longhorn
+          - name: retired-child
+            state: absent
         acl:
           entries:
             - principal: alice

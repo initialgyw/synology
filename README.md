@@ -8,12 +8,15 @@ Manage Synology NAS shared folders through the Synology Web API.
 - [Usage](#usage)
   - [Credentials and global options](#credentials-and-global-options)
   - [List shares](#list-shares)
+  - [List directories](#list-directories)
+  - [Remove a directory](#remove-a-directory)
   - [Delete a share](#delete-a-share)
   - [Create a share](#create-a-share)
     - [Create-share options](#create-share-options)
       - [Quota](#quota)
       - [Recycle bin](#recycle-bin)
-      - [Compression](#compression)
+          - [Compression](#compression)
+  - [Add a directory](#add-a-directory)
   - [Modify a share](#modify-a-share)
   - [Config import](#config-import)
   - [Apply configuration](#apply-configuration)
@@ -133,6 +136,37 @@ render as `?` in tables. Diagnostics go to stderr and the command exits `60` whi
 preserving available rows. Structured output retains UUIDs and full permission/NFS
 information without internal observation fields.
 
+### List directories
+
+`list-dirs` performs a read-only NAS lookup and lists every immediate child directory
+inside an existing share. It does not recurse and excludes files. Pagination is handled
+internally; no pagination options are required.
+
+```bash
+syn-cli list-dirs -s projects
+syn-cli list-dirs -s projects --output json
+syn-cli list-dirs -s projects --output yaml
+```
+
+The command returns exit code `0` for an empty or non-empty listing. Authentication,
+transport, malformed-response, and missing-share failures use the existing error codes.
+
+### Remove a directory
+
+`rm-dir` removes exactly one empty immediate child directory. It never recurses and
+never deletes files. Without `--yes`, it authenticates and performs a read-only
+preflight, returning a planned result without deleting anything.
+
+```bash
+syn-cli rm-dir -s projects projectA
+syn-cli rm-dir -s projects projectA --yes
+syn-cli rm-dir -s projects projectA --yes --output json
+```
+
+Missing targets, file targets, and non-empty directories fail before mutation with
+exit code `10`. If deletion or post-delete verification is uncertain, the command
+returns exit code `60`; inspect the NAS before retrying.
+
 ### Delete a share
 
 Without `--yes`, deletion validates the exact share name, prints a local plan, avoids
@@ -216,6 +250,28 @@ Request compression when DSM, NAS model, volume, and filesystem support it:
 ```bash
 syn-cli create-share compressed --path /volume1 --compress --yes
 ```
+
+### Add a directory
+
+`add-dir` creates exactly one child directory in an existing DSM share. It
+has no ACL or NFS options: permissions remain those managed by DSM and the parent
+share.
+
+```bash
+syn-cli add-dir -s projects archives
+syn-cli add-dir -s projects archives --yes --output json
+```
+
+Without `--yes`, the command authenticates and performs a read-only NAS preflight,
+then reports the resolved target path and exits `0`; it never creates, overwrites,
+recursively creates, or deletes. If the target already exists, it prints an error and
+exits `10`. With `--yes`, it performs the same preflight, creates the directory, and
+reads it back before reporting success. Creation is non-idempotent.
+
+DSM Share and FileStation APIs use different path forms internally. The command
+checks DSM's FileStation mapping and reports the verified physical NAS path such as
+`/volume1/projects/archives`; this mapping is implementation detail, not an
+additional path option.
 
 ### Modify a share
 
@@ -316,8 +372,18 @@ syn-cli apply-config examples/apply-config-v1.yaml --yes --output json
 The root is a mapping with `version: 1` and `volumes`; `host` and
 `principal_lookup_share` are optional. The latter is the exact existing share used only
 for read-only DSM ACL inventory and cannot be `state: absent`. Each absolute volume maps
-to `shares`; fields are `name`, `state`, `description`, `quota`, `acl`, and `nfs`.
-Unknown fields, duplicate YAML keys, malformed values, duplicate share names/ACL
+to `shares`; fields are `name`, `state`, `description`, `quota`, `acl`, `nfs`, and
+`directories`. `directories` is an optional managed list of immediate child directory
+components. Each item has exactly `name` and optional `state` (`present` by default or
+`absent`). Omitted directories and `directories: []` leave all children untouched. A
+present item creates a missing directory and leaves an existing directory unchanged; a
+file target is rejected. An absent item leaves a missing directory unchanged, deletes
+only an empty directory, and rejects files and nonempty directories during preflight.
+Directories are not allowed on absent shares. New-share directory targets are
+preflighted from the configured volume/share placement before the apply plan mutates
+anything; their live File Station mapping is resolved after the share is created.
+Unknown fields, duplicate YAML keys,
+malformed values, duplicate share names/ACL
 identities/normalized NFS clients are rejected. `state` defaults to `present`;
 `state: absent` permits only `name` and `state`.
 
@@ -380,7 +446,7 @@ local-plan code `11`.
 | `0` | Success |
 | `2` | Command-line syntax or usage error |
 | `10` | Configuration or validation failure |
-| `11` | Validated local create/delete/modify plan; no mutation |
+| `11` | Validated local create/delete/modify plan; no NAS contact or mutation |
 | `12` | Local config-import persistence failure |
 | `20` | Authentication or authorization failure |
 | `30` | Transport, TLS, or network failure |
