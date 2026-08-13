@@ -40,6 +40,7 @@ jobs:
       - name: Create or verify tag
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         shell: bash
         run: |
           tag="v${VERSION}"
@@ -54,4 +55,4 @@ jobs:
             exit 1
           fi
           git tag "$tag" "$commit"
-          git push origin "$tag"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$tag"
